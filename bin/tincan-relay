@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# tincan-relay <claude-session-name>  --  OPTIONAL, and must run OUTSIDE Codex's sandbox.
+#
+# Alternative to tincan-listen. Instead of the Claude session polling for requests,
+# this relay watches for them and delivers each one into the live Claude session as a
+# real cross-session message -- so it renders inline in the chat, in full, instead of
+# arriving as a truncated background notification.
+#
+# Why a separate process: `claude mcp serve` cannot create its unix socket inside
+# Codex's sandbox and hangs forever (docs/CONSTRAINTS.md #5). Run this from an
+# ordinary shell and the same call works fine.
+#
+# Use tincan-listen OR tincan-relay, never both -- they both consume requests.
+set -u
+
+TARGET="${1:-${CLAUDE_SESSION:-}}"
+[ -z "$TARGET" ] && { echo "usage: tincan-relay <claude-session-name>" >&2; exit 2; }
+
+DIR="${TINCAN_DIR:-/tmp/tincan}"
+POLL="${TINCAN_POLL:-3}"
+mkdir -p "$DIR/requests" 2>/dev/null
+
+echo "[tincan-relay] delivering to Claude session '$TARGET'; polling $DIR/requests" >&2
+
+while true; do
+  find "$DIR/requests" -name 'req-*.txt' -type f 2>/dev/null | while read -r f; do
+    BODY="$(cat "$f" 2>/dev/null)"
+    python3 - "$TARGET" "$BODY" <<'PY'
+import json, subprocess, sys
+target, msg = sys.argv[1], sys.argv[2]
+reqs = [
+ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05",
+   "capabilities":{},"clientInfo":{"name":"tincan-relay","version":"1"}}},
+ {"jsonrpc":"2.0","method":"notifications/initialized"},
+ {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"SendMessage",
+   "arguments":{"to":target,"summary":"tincan: review requested","message":msg}}},
+]
+try:
+    p = subprocess.run(["claude","mcp","serve"],
+          input="\n".join(json.dumps(r) for r in reqs)+"\n",
+          capture_output=True, text=True, timeout=120)
+    print("delivered" if "msg_id" in p.stdout else "DELIVERY FAILED", file=sys.stderr)
+except subprocess.TimeoutExpired:
+    print("DELIVERY TIMED OUT (are you inside a sandbox?)", file=sys.stderr)
+PY
+    mv "$f" "$f.seen" 2>/dev/null
+  done
+  sleep "$POLL"
+done

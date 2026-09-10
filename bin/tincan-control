@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""Configure and inspect tincan's per-repository review gate."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+MARKER = "# tincan-review-gate"
+
+
+def run(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=check)
+
+
+def repo_paths(repo_arg: str) -> tuple[Path, Path, Path]:
+    candidate = Path(repo_arg).expanduser().resolve()
+    try:
+        root = Path(run(["git", "rev-parse", "--show-toplevel"], candidate).stdout.strip())
+        git_dir_raw = run(["git", "rev-parse", "--path-format=absolute", "--git-dir"], root).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise SystemExit(f"not a git repository: {candidate}") from exc
+    git_dir = Path(git_dir_raw)
+    return root, git_dir, git_dir / "tincan"
+
+
+def state_file(state_dir: Path) -> Path:
+    return state_dir / "state.json"
+
+
+def load_state(state_dir: Path) -> dict:
+    try:
+        return json.loads(state_file(state_dir).read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state_dir: Path, state: dict) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_file(state_dir)
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    temp.replace(path)
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def issue_context(root: Path, issue: str) -> tuple[str, str]:
+    result = run(
+        ["gh", "issue", "view", issue, "--json", "number,title,body,url"],
+        root,
+        check=False,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise SystemExit(
+            f"could not read issue {issue} with GitHub CLI:\n{detail}\n"
+            "Run `gh auth login`, then try again."
+        )
+    data = json.loads(result.stdout)
+    label = f"Issue #{data['number']}: {data['title']}"
+    context = f"{label}\n{data['url']}\n\n{data.get('body') or '(no issue body)'}"
+    return label, context
+
+
+def hook_toml(hook: Path) -> str:
+    command = json.dumps(str(hook))
+    return f"""{MARKER}
+[features]
+hooks = true
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = {command}
+timeout = 900
+statusMessage = "Claude is reviewing the work"
+"""
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    root, git_dir, _ = repo_paths(args.repo)
+    config_path = root / ".codex" / "config.toml"
+    hook = (Path(__file__).resolve().parent / "tincan-review-hook").resolve()
+    if config_path.exists():
+        current = config_path.read_text()
+        if MARKER in current:
+            print(f"already installed: {config_path}")
+            return 0
+        raise SystemExit(
+            f"{config_path} already exists. Tincan did not modify it.\n\n"
+            "Add this hook manually:\n\n"
+            f"{hook_toml(hook)}"
+        )
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(hook_toml(hook))
+    exclude = git_dir / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    existing = exclude.read_text() if exclude.exists() else ""
+    if ".codex/config.toml" not in existing.splitlines():
+        with exclude.open("a") as handle:
+            if existing and not existing.endswith("\n"):
+                handle.write("\n")
+            handle.write(".codex/config.toml\n")
+
+    print(f"installed: {config_path}")
+    print("Codex will ask you to trust the project hook the first time it sees it.")
+    return 0
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    root, _, state_dir = repo_paths(args.repo)
+    config_path = root / ".codex" / "config.toml"
+    if not config_path.exists() or MARKER not in config_path.read_text():
+        raise SystemExit(f"review hook is not installed; run: tincan install --repo {root}")
+
+    label = "the task described in the Codex chat"
+    contexts: list[str] = []
+    if args.issue:
+        label, fetched = issue_context(root, args.issue)
+        contexts.append(fetched)
+    if args.task:
+        contexts.append("Additional instructions:\n" + " ".join(args.task))
+
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = state_dir / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    log_path = run_dir / "events.log"
+    log_path.write_text(
+        f"TINCAN REVIEW GATE\nrepo: {root}\ntask: {label}\nstarted: {now()}\n\n"
+    )
+    base = run(["git", "rev-parse", "HEAD"], root).stdout.strip()
+    state = {
+        "enabled": True,
+        "status": "armed",
+        "created_at": now(),
+        "repo": str(root),
+        "base_commit": base,
+        "task_label": label,
+        "task_context": "\n\n".join(contexts),
+        "max_rounds": args.max_rounds,
+        "round": 0,
+        "session_id": None,
+        "claude_session_id": None,
+        "run_dir": str(run_dir),
+        "log_path": str(log_path),
+    }
+    save_state(state_dir, state)
+    print(f"armed for {label}")
+    print(f"base: {base[:12]}")
+    print("Now use Codex normally. Its next completed turn in this repo will claim the gate.")
+    print(f"Claude activity: tincan watch --repo {root}")
+    return 0
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    _, _, state_dir = repo_paths(args.repo)
+    state = load_state(state_dir)
+    if not state:
+        print("not armed")
+        return 0
+    state["enabled"] = False
+    state["status"] = "stopped"
+    state["stopped_at"] = now()
+    save_state(state_dir, state)
+    print("review gate stopped")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    root, _, state_dir = repo_paths(args.repo)
+    state = load_state(state_dir)
+    config = root / ".codex" / "config.toml"
+    installed = config.exists() and MARKER in config.read_text()
+    print(f"repo:      {root}")
+    print(f"installed: {'yes' if installed else 'no'}")
+    if not state:
+        print("gate:      not armed")
+        return 0
+    print(f"gate:      {state.get('status', 'unknown')}")
+    print(f"task:      {state.get('task_label', '(unspecified)')}")
+    print(f"round:     {state.get('round', 0)}/{state.get('max_rounds', '?')}")
+    print(f"codex:     {state.get('session_id') or '(not claimed yet)'}")
+    print(f"claude:    {state.get('claude_session_id') or '(not started yet)'}")
+    print(f"log:       {state.get('log_path', '(none)')}")
+    return 0
+
+
+def cmd_log_path(args: argparse.Namespace) -> int:
+    _, _, state_dir = repo_paths(args.repo)
+    path = load_state(state_dir).get("log_path")
+    if not path:
+        raise SystemExit("no tincan run exists for this repository")
+    print(path)
+    return 0
+
+
+def cmd_issues(args: argparse.Namespace) -> int:
+    root, _, _ = repo_paths(args.repo)
+    result = subprocess.run(["gh", "issue", "list", "--limit", str(args.limit)], cwd=root)
+    if result.returncode:
+        print("GitHub CLI could not list issues. Run `gh auth login` and retry.", file=sys.stderr)
+    return result.returncode
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(prog="tincan-control")
+    sub = result.add_subparsers(dest="command", required=True)
+    for name in ("install", "stop", "status", "log-path"):
+        item = sub.add_parser(name)
+        item.add_argument("--repo", default=".")
+        item.set_defaults(func=globals()[f"cmd_{name.replace('-', '_')}"])
+
+    start = sub.add_parser("start")
+    start.add_argument("--repo", default=".")
+    start.add_argument("--issue")
+    start.add_argument("--max-rounds", type=int, choices=range(1, 11), default=5)
+    start.add_argument("task", nargs="*")
+    start.set_defaults(func=cmd_start)
+
+    issues = sub.add_parser("issues")
+    issues.add_argument("--repo", default=".")
+    issues.add_argument("--limit", type=int, default=30)
+    issues.set_defaults(func=cmd_issues)
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

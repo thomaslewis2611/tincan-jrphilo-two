@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# tincan-listen  --  the CLAUDE side of the string.
+#
+# Emits one event per incoming request. Intended to be run as a Monitor so each
+# request wakes the Claude session.
+#
+# NOTE: uses `find`, not a glob. An unmatched glob is fatal in zsh and kills the
+# loop (docs/CONSTRAINTS.md #6).
+set -u
+DIR="${TINCAN_DIR:-/tmp/tincan}"
+POLL="${TINCAN_POLL:-3}"
+mkdir -p "$DIR/requests" 2>/dev/null
+
+while true; do
+  find "$DIR/requests" -name 'req-*.txt' -type f 2>/dev/null | while read -r f; do
+    echo "=== TINCAN REQUEST ($f) ==="
+    cat "$f" 2>/dev/null
+    echo "=== END REQUEST ==="
+    mv "$f" "$f.seen" 2>/dev/null
+  done
+  sleep "$POLL"
+done

@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Open a real Codex + Claude Code pair using a Warp Tab Config."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import shlex
+import subprocess
+import sys
+import tempfile
+
+
+CONFIG_STEM = "tincan_pair"
+HOOK_MARKER = "# tincan-review-gate"
+
+
+def fail(message: str) -> "NoReturn":
+    print(f"tincan: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def repo_root(candidate: str) -> Path:
+    path = Path(candidate).expanduser().resolve()
+    if not path.is_dir():
+        fail(f"repository path does not exist: {path}")
+
+    result = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        fail(f"not inside a Git repository: {path}")
+    return Path(result.stdout.strip()).resolve()
+
+
+def toml_string(value: str) -> str:
+    # JSON strings use the same quoting and escapes needed here by TOML.
+    return json.dumps(value)
+
+
+def git_dir(repo: Path) -> Path:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-dir"],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode:
+        fail(f"could not locate Git metadata for {repo}")
+    return Path(result.stdout.strip()).resolve()
+
+
+def ensure_hook(repo: Path) -> None:
+    config = repo / ".codex" / "config.toml"
+    if config.exists() and HOOK_MARKER in config.read_text():
+        return
+    control = Path(__file__).resolve().with_name("tincan-control")
+    result = subprocess.run([str(control), "install", "--repo", str(repo)])
+    if result.returncode:
+        fail("could not install the Codex handoff hook; see the message above")
+
+
+def create_session(repo: Path, token: str, max_rounds: int) -> Path:
+    state_dir = git_dir(repo) / "tincan"
+    sessions = state_dir / "pane-sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    claude_hook = Path(__file__).resolve().with_name("tincan-claude-hook")
+    settings_path = sessions / f"{token}-claude-settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": str(claude_hook),
+                                    "timeout": 30,
+                                    "statusMessage": "Sending Claude's review to Codex",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    value = {
+        "enabled": True,
+        "mode": "visible-review-loop",
+        "repo": str(repo),
+        "session_token": token,
+        "status": "awaiting-codex",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "handoffs": 0,
+        "round": 0,
+        "max_rounds": max_rounds,
+        "claude_settings": str(settings_path),
+    }
+    session_path = sessions / f"{token}.json"
+    session_path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    active = state_dir / "active-pane-session.json"
+    temporary = active.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    temporary.replace(active)
+    return session_path
+
+
+def render_config(repo: Path, session: str) -> str:
+    repo_text = str(repo)
+    tincan = Path(__file__).resolve().with_name("tincan")
+    codex_command = " ".join(
+        shlex.quote(part)
+        for part in (str(tincan), "codex-pane", "--repo", repo_text, "--session", session)
+    )
+    claude_command = " ".join(
+        shlex.quote(part)
+        for part in (str(tincan), "claude-pane", "--repo", repo_text, "--session", session)
+    )
+    return f'''name = "Tincan Pair"
+title = {toml_string(f"Tincan · {repo.name}")}
+color = "cyan"
+
+[[panes]]
+id = "root"
+split = "horizontal"
+children = ["codex", "claude"]
+
+[[panes]]
+id = "codex"
+type = "terminal"
+directory = {toml_string(repo_text)}
+commands = [{toml_string(codex_command)}]
+is_focused = true
+
+[[panes]]
+id = "claude"
+type = "terminal"
+directory = {toml_string(repo_text)}
+commands = [{toml_string(claude_command)}]
+'''
+
+
+def write_config(repo: Path, session: str) -> Path:
+    config_dir = Path(
+        os.environ.get("TINCAN_WARP_CONFIG_DIR", "~/.warp/tab_configs")
+    ).expanduser()
+    config_dir.mkdir(parents=True, exist_ok=True)
+    destination = config_dir / f"{CONFIG_STEM}.toml"
+
+    handle, temporary_name = tempfile.mkstemp(
+        prefix=f".{CONFIG_STEM}.", suffix=".toml", dir=config_dir
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(render_config(repo, session))
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Open real Codex and Claude Code TUIs side by side in Warp."
+    )
+    parser.add_argument(
+        "--repo",
+        default=".",
+        help="Git repository to open (default: current repository)",
+    )
+    parser.add_argument(
+        "--tab",
+        action="store_true",
+        help="open a tab in the current Warp window instead of a new window",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="write the config but do not launch Warp",
+    )
+    parser.add_argument(
+        "--max-rounds",
+        type=int,
+        choices=range(1, 11),
+        default=5,
+        help="maximum Claude review rounds before asking a human (default: 5)",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    repo = repo_root(args.repo)
+
+    missing = [command for command in ("codex", "claude") if not shutil.which(command)]
+    if missing and not args.dry_run:
+        fail(f"missing from PATH: {', '.join(missing)}")
+
+    session = secrets.token_hex(16)
+    if not args.dry_run:
+        ensure_hook(repo)
+        create_session(repo, session, args.max_rounds)
+    destination = write_config(repo, session)
+    uri = f"warp://tab_config/{CONFIG_STEM}"
+    if not args.tab:
+        uri += "?new_window=true"
+
+    if args.dry_run:
+        print(f"wrote {destination}")
+        print(f"would create paired session {session}")
+        print(f"would open {uri}")
+        return 0
+
+    try:
+        subprocess.run(["open", uri], check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        fail("could not open Warp; is Warp installed and registered for warp:// links?")
+
+    print(f"opened Tincan for {repo} (session {session[:8]})")
+    print("Ready. Give Codex a normal task.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

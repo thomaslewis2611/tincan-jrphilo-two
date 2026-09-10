@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""Transparent interactive pane relay used by Tincan experiments."""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import pty
+import selectors
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import tty
+
+
+def fail(message: str) -> "NoReturn":
+    print(f"tincan: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def repo_root(candidate: str) -> Path:
+    path = Path(candidate).expanduser().resolve()
+    result = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        fail(f"not inside a Git repository: {path}")
+    return Path(result.stdout.strip()).resolve()
+
+
+def control_socket_path(
+    repo: Path, session: str | None = None, agent: str = "claude"
+) -> Path:
+    identity = f"{repo}\0{session or 'legacy'}\0{agent}"
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"tincan-panes-{os.getuid()}" / digest / "claude.sock"
+
+
+def active_session(repo: Path) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-dir"],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode:
+        return None
+    state_dir = Path(result.stdout.strip()) / "tincan"
+    path = state_dir / "active-pane-session.json"
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    token = state.get("session_token")
+    if isinstance(token, str):
+        current = load_session_file(state_dir / "pane-sessions" / f"{token}.json")
+        if current.get("enabled"):
+            return token
+    return None
+
+
+def load_session_file(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def prepare_server(path: Path, agent: str) -> socket.socket:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+
+    if path.exists():
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(str(path))
+        except OSError:
+            path.unlink(missing_ok=True)
+        else:
+            probe.close()
+            fail(f"a controlled {agent.title()} pane is already running for this session")
+        finally:
+            probe.close()
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(path))
+    path.chmod(0o600)
+    server.listen()
+    server.setblocking(False)
+    return server
+
+
+def copy_window_size(source: int, destination: int) -> None:
+    try:
+        size = fcntl.ioctl(source, termios.TIOCGWINSZ, b"\0" * 8)
+        fcntl.ioctl(destination, termios.TIOCSWINSZ, size)
+    except OSError:
+        pass
+
+
+def write_all(fd: int, data: bytes) -> None:
+    while data:
+        written = os.write(fd, data)
+        data = data[written:]
+
+
+def encoded_prompt(text: str) -> bytes:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if "\x00" in text:
+        fail("prompt cannot contain a NUL byte")
+    if "\n" in text:
+        return b"\x1b[200~" + text.encode() + b"\x1b[201~\r"
+    return text.encode() + b"\r"
+
+
+def run_agent(repo: Path, session: str | None, agent: str, argv: list[str]) -> int:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        fail(f"{agent}-pane must run in an interactive terminal")
+
+    path = control_socket_path(repo, session, agent)
+    server = prepare_server(path, agent)
+    pid, master = pty.fork()
+    if pid == 0:
+        os.chdir(repo)
+        if session:
+            os.environ["TINCAN_SESSION"] = session
+        os.execvp(argv[0], argv)
+
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    original_terminal = termios.tcgetattr(stdin_fd)
+    selector = selectors.DefaultSelector()
+    clients: dict[socket.socket, bytearray] = {}
+    child_status: int | None = None
+    terminal_closed = False
+
+    def resize(_signum: int | None = None, _frame: object | None = None) -> None:
+        copy_window_size(stdin_fd, master)
+        try:
+            os.kill(pid, signal.SIGWINCH)
+        except ProcessLookupError:
+            pass
+
+    try:
+        tty.setraw(stdin_fd)
+        resize()
+        signal.signal(signal.SIGWINCH, resize)
+        selector.register(stdin_fd, selectors.EVENT_READ, "terminal")
+        selector.register(master, selectors.EVENT_READ, "agent")
+        selector.register(server, selectors.EVENT_READ, "server")
+
+        while child_status is None and not terminal_closed:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+            if waited == pid:
+                child_status = status
+                break
+
+            for key, _events in selector.select(timeout=0.25):
+                if key.data == "terminal":
+                    data = os.read(stdin_fd, 65536)
+                    if not data:
+                        terminal_closed = True
+                        break
+                    write_all(master, data)
+                elif key.data == "agent":
+                    try:
+                        data = os.read(master, 65536)
+                    except OSError as error:
+                        if error.errno == errno.EIO:
+                            waited, status = os.waitpid(pid, 0)
+                            child_status = status if waited == pid else 1
+                            break
+                        raise
+                    if data:
+                        write_all(stdout_fd, data)
+                elif key.data == "server":
+                    client, _ = server.accept()
+                    client.setblocking(False)
+                    clients[client] = bytearray()
+                    selector.register(client, selectors.EVENT_READ, "client")
+                else:
+                    client = key.fileobj
+                    assert isinstance(client, socket.socket)
+                    data = client.recv(65536)
+                    if data:
+                        clients[client].extend(data)
+                        if b"\n" not in clients[client]:
+                            continue
+                        line, _separator, _remainder = clients[client].partition(b"\n")
+                        try:
+                            request = json.loads(line)
+                            prompt = request["prompt"]
+                            if not isinstance(prompt, str) or not prompt:
+                                raise ValueError("prompt must be a non-empty string")
+                            write_all(master, encoded_prompt(prompt))
+                            client.sendall(b'{"ok": true}\n')
+                        except (KeyError, ValueError, json.JSONDecodeError) as error:
+                            response = json.dumps({"ok": False, "error": str(error)})
+                            client.sendall(response.encode() + b"\n")
+                        selector.unregister(client)
+                        client.close()
+                        clients.pop(client, None)
+                    else:
+                        selector.unregister(client)
+                        client.close()
+                        clients.pop(client, None)
+    finally:
+        termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, original_terminal)
+        for client in clients:
+            client.close()
+        selector.close()
+        server.close()
+        path.unlink(missing_ok=True)
+        try:
+            if child_status is None:
+                waited, status = os.waitpid(pid, os.WNOHANG)
+                if waited == 0:
+                    os.kill(pid, signal.SIGHUP)
+                    _waited, status = os.waitpid(pid, 0)
+                child_status = status
+        except ProcessLookupError:
+            pass
+        os.close(master)
+
+    if child_status is None:
+        return 1
+    return os.waitstatus_to_exitcode(child_status)
+
+
+def session_state(repo: Path, session: str) -> dict:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-dir"],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode:
+        return {}
+    path = Path(result.stdout.strip()) / "tincan" / "pane-sessions" / f"{session}.json"
+    return load_session_file(path)
+
+
+def run_claude(repo: Path, session: str | None) -> int:
+    argv = ["claude", "--permission-mode", "auto"]
+    if session:
+        settings = session_state(repo, session).get("claude_settings")
+        if isinstance(settings, str):
+            argv.extend(["--settings", settings])
+    return run_agent(repo, session, "claude", argv)
+
+
+def run_codex(repo: Path, session: str) -> int:
+    return run_agent(repo, session, "codex", ["codex", "--approve-for-me"])
+
+
+def send_prompt(
+    repo: Path,
+    prompt: str,
+    wait_seconds: float,
+    session: str | None = None,
+    agent: str = "claude",
+) -> int:
+    selected_session = session or active_session(repo)
+    path = control_socket_path(repo, selected_session, agent)
+    deadline = time.monotonic() + wait_seconds
+    last_error: OSError | None = None
+    while True:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            client.connect(str(path))
+            break
+        except OSError as error:
+            last_error = error
+            client.close()
+            if time.monotonic() >= deadline:
+                detail = f" ({last_error})" if last_error else ""
+                suffix = f" for session {selected_session[:8]}" if selected_session else ""
+                fail(
+                    f"no controlled {agent.title()} pane is running for this repository"
+                    f"{suffix}{detail}"
+                )
+            time.sleep(0.1)
+
+    with client:
+        request = json.dumps({"prompt": prompt}).encode() + b"\n"
+        client.sendall(request)
+        response = bytearray()
+        while b"\n" not in response:
+            chunk = client.recv(65536)
+            if not chunk:
+                fail("Claude pane closed before acknowledging the prompt")
+            response.extend(chunk)
+
+    result = json.loads(response.partition(b"\n")[0])
+    if not result.get("ok"):
+        fail(f"Claude pane rejected the prompt: {result.get('error', 'unknown error')}")
+    print(f"sent prompt to {agent.title()} in {repo}")
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    codex = subparsers.add_parser("codex")
+    codex.add_argument("--repo", default=".")
+    codex.add_argument("--session", required=True)
+
+    claude = subparsers.add_parser("claude")
+    claude.add_argument("--repo", default=".")
+    claude.add_argument("--session")
+
+    send = subparsers.add_parser("send")
+    send.add_argument("prompt", nargs="?")
+    send.add_argument("--repo", default=".")
+    send.add_argument("--session")
+    send.add_argument("--agent", choices=("codex", "claude"), default="claude")
+    send.add_argument("--wait", type=float, default=2.0)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    repo = repo_root(args.repo)
+    if args.command == "codex":
+        return run_codex(repo, args.session)
+    if args.command == "claude":
+        return run_claude(repo, args.session)
+    prompt = args.prompt if args.prompt is not None else sys.stdin.read()
+    if not prompt:
+        fail("send requires a prompt argument or prompt text on stdin")
+    return send_prompt(repo, prompt, args.wait, args.session, args.agent)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

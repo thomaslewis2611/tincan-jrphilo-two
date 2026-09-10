@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# tincan -- two agents, two chats, one piece of string.
+set -u
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DIR="${TINCAN_DIR:-/tmp/tincan}"
+
+usage() {
+  cat <<'USAGE'
+tincan [command]
+
+  (no command)         open real Codex + Claude panes for the current repo
+  warp [--repo P]      open real Codex + Claude panes in Warp
+  send-claude MESSAGE  submit a prompt to the visible Claude pane
+  send-codex MESSAGE   submit a prompt to the visible Codex pane
+
+  install [--repo P]  install the Codex review hook in a repository
+  issues  [--repo P]  list open GitHub issues
+  start [options]     arm one automatic Codex -> Claude review loop
+  status [--repo P]   show the current review gate and session IDs
+  watch  [--repo P]   stream Claude's review messages and tool calls
+  stop   [--repo P]   disarm the review gate
+  doctor              check prerequisites and report what works
+
+Legacy file bridge:
+  listen              watch for requests (Claude side; run as a Monitor)
+  ask "<message>"     request a review and block (Codex side)
+  demo "<task>"       end-to-end test: drives a real Codex that asks Claude for review
+  transcript          print the full exchange so far
+  clear               wipe pending requests, replies and transcript
+
+Start here:
+  cd ~/dev/reels && tincan
+
+Automated review gate:
+  tincan install --repo ~/dev/reels
+  tincan start --repo ~/dev/reels --issue 17
+  tincan watch --repo ~/dev/reels
+USAGE
+}
+
+cmd="${1:-}"; shift 2>/dev/null || true
+
+case "$cmd" in
+  warp)
+    exec "$HERE/tincan-warp" "$@"
+    ;;
+
+  claude-pane)
+    exec "$HERE/tincan-pane" claude "$@"
+    ;;
+
+  codex-pane)
+    exec "$HERE/tincan-pane" codex "$@"
+    ;;
+
+  send-claude)
+    exec "$HERE/tincan-pane" send "$@"
+    ;;
+
+  send-codex)
+    exec "$HERE/tincan-pane" send --agent codex "$@"
+    ;;
+
+  install|issues|start|stop)
+    exec "$HERE/tincan-control" "$cmd" "$@"
+    ;;
+
+  status)
+    exec "$HERE/tincan-control" status "$@"
+    ;;
+
+  watch)
+    LOG="$("$HERE/tincan-control" log-path "$@")" || exit $?
+    echo "watching $LOG (Ctrl-C stops the viewer, not the review gate)"
+    exec tail -n +1 -F "$LOG"
+    ;;
+
+  doctor)
+    echo "tincan doctor"
+    echo
+    ok=0; bad=0
+    chk() { if eval "$2" >/dev/null 2>&1; then echo "  OK    $1"; ok=$((ok+1)); else echo "  FAIL  $1 -- $3"; bad=$((bad+1)); fi; }
+    chk "codex on PATH"            "command -v codex"        "install: curl -fsSL https://chatgpt.com/codex/install.sh | sh"
+    chk "claude on PATH"           "command -v claude"       "Claude Code not installed"
+    chk "Codex hook support"       "codex features list 2>/dev/null | grep -q hooks" "update Codex"
+    chk "review hook executable"   "test -x '$HERE/tincan-review-hook'" "chmod +x bin/tincan-review-hook"
+    chk "control executable"       "test -x '$HERE/tincan-control'" "chmod +x bin/tincan-control"
+    chk "Claude authenticated"     "claude auth status 2>/dev/null | grep -q '\"loggedIn\": true'" "run: claude auth login"
+    if gh auth status >/dev/null 2>&1; then
+      echo "  OK    GitHub authenticated (optional; used by 'tincan issues')"
+    else
+      echo "  INFO  GitHub authentication unavailable (optional)"
+    fi
+    echo
+    echo "  auth (run outside a sandbox if these look wrong):"
+    codex login status 2>&1 | sed 's/^/    /' || true
+    claude auth status 2>&1 | sed 's/^/    /' || true
+    echo
+    [ "$bad" -eq 0 ] && echo "Ready. Next: tincan install --repo <repo>" || echo "$bad check(s) failed above."
+    ;;
+
+  listen)  exec "$HERE/tincan-listen" ;;
+  ask)     exec "$HERE/tincan-ask" "$@" ;;
+
+  demo)
+    TASK="${1:-Explain what this repository does, in three sentences.}"
+    command -v codex >/dev/null 2>&1 || { echo "codex not on PATH"; exit 1; }
+    pgrep -f tincan-listen >/dev/null 2>&1 || echo "WARNING: no listener running -- your request will not be answered. Ask your Claude session to run 'tincan listen' first." >&2
+    echo "== tincan demo =="
+    echo "task: $TASK"
+    echo "Codex will do the work, then ask Claude to review it. Watch both sides."
+    echo
+    codex exec --sandbox read-only --skip-git-repo-check "$TASK
+
+When you have an answer, get it reviewed before you finish. Run exactly:
+
+  $HERE/tincan-ask \"<your work, plus enough context for a reviewer who cannot see this chat>\"
+
+It blocks until Claude replies -- that is expected, wait for it, do not cancel.
+Read the review it prints, respond to each finding, and if anything is blocking,
+call the same command again with what you changed. Stop when the reviewer replies
+with the token NO FINDINGS." < /dev/null
+    ;;
+
+  transcript)
+    [ -f "$DIR/transcript.md" ] && cat "$DIR/transcript.md" || echo "(no exchanges yet)"
+    ;;
+
+  clear)
+    rm -rf "$DIR/requests" "$DIR"/reply-*.md "$DIR/transcript.md" 2>/dev/null
+    mkdir -p "$DIR/requests"; echo "cleared $DIR"
+    ;;
+
+  "") exec "$HERE/tincan-warp" --repo . ;;
+  -h|--help|help) usage ;;
+  *) echo "unknown command: $cmd"; echo; usage; exit 2 ;;
+esac

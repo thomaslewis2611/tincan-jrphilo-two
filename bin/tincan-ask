@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# tincan-ask "<message>"  --  the CODEX side of the string.
+#
+# Asks the Claude window for a review and blocks until it replies, printing the
+# reply to stdout so the calling agent reads it as tool output.
+#
+# Deliberately spawns NO subprocesses. Anything that shells out to `claude` hangs
+# inside Codex's sandbox (see docs/CONSTRAINTS.md #5).
+set -u
+
+MSG="${1:-}"
+[ -z "$MSG" ] && { echo "usage: tincan-ask \"<message>\"" >&2; exit 2; }
+
+DIR="${TINCAN_DIR:-/tmp/tincan}"
+ROUNDS="${TINCAN_TIMEOUT_ROUNDS:-300}"   # x 2s = 10 minutes
+
+mkdir -p "$DIR/requests" 2>/dev/null
+ID="$(date +%s)-$$"
+REPLY="$DIR/reply-$ID.md"
+rm -f "$REPLY"
+
+{
+  printf 'REPLY_PATH: %s\n' "$REPLY"
+  printf -- '---\n'
+  printf '%s\n' "$MSG"
+} > "$DIR/requests/req-$ID.txt"
+
+LOG="$DIR/transcript.md"
+{
+  printf '\n## %s  CODEX -> CLAUDE  (%s)\n\n' "$(date '+%H:%M:%S')" "$ID"
+  printf '%s\n' "$MSG"
+} >> "$LOG" 2>/dev/null
+
+echo "[tincan] asked (id $ID); waiting up to $((ROUNDS * 2 / 60)) min..." >&2
+
+i=0
+while [ "$i" -lt "$ROUNDS" ]; do
+  if [ -f "$REPLY" ]; then
+    {
+      printf '\n## %s  CLAUDE -> CODEX  (%s)\n\n' "$(date '+%H:%M:%S')" "$ID"
+      cat "$REPLY"
+    } >> "$LOG" 2>/dev/null
+    cat "$REPLY"; exit 0
+  fi
+  sleep 2
+  i=$((i + 1))
+done
+
+echo "TIMEOUT: no reply from Claude. Report to the user as complete-but-unreviewed." >&2
+exit 1

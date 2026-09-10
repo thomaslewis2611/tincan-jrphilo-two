@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""Codex Stop hook that asks Claude Code for a read-only review."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, TextIO
+
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["approved", "changes_requested"]},
+        "summary": {"type": "string"},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string", "enum": ["blocking", "suggestion"]},
+                    "title": {"type": "string"},
+                    "details": {"type": "string"},
+                    "file": {"type": ["string", "null"]},
+                    "line": {"type": ["integer", "null"]},
+                },
+                "required": ["severity", "title", "details", "file", "line"],
+                "additionalProperties": False,
+            },
+        },
+        "verification": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["verdict", "summary", "findings", "verification"],
+    "additionalProperties": False,
+}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def git_paths(cwd: Path) -> tuple[Path, Path] | None:
+    root_result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], cwd=cwd, text=True, capture_output=True
+    )
+    if root_result.returncode:
+        return None
+    root = Path(root_result.stdout.strip())
+    dir_result = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-dir"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+    )
+    if dir_result.returncode:
+        return None
+    return root, Path(dir_result.stdout.strip())
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    temp.replace(path)
+
+
+def has_changes(root: Path, base_commit: str | None) -> bool:
+    if not base_commit:
+        return True
+    diff = subprocess.run(
+        ["git", "diff", "--quiet", base_commit, "--"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+    )
+    if diff.returncode == 1:
+        return True
+    if diff.returncode not in (0, 1):
+        return True
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=normal"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+    )
+    return status.returncode != 0 or bool(status.stdout.strip())
+
+
+def emit(value: dict[str, Any]) -> None:
+    print(json.dumps(value, separators=(",", ":")))
+
+
+def append_log(path: Path, message: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        handle.write(message)
+        if not message.endswith("\n"):
+            handle.write("\n")
+
+
+def visible_review_prompt(
+    root: Path, event: dict[str, Any], round_number: int
+) -> str:
+    return f"""Review round {round_number}.
+
+Codex summary:
+{event.get('last_assistant_message') or '(Codex supplied no final report.)'}
+
+Review the current work in {root}. Inspect the changes, relevant surrounding code, and applicable
+AGENTS.md or CLAUDE.md instructions. Run useful verification when appropriate. Do not edit.
+
+Be adversarial but evidence-driven. Separate concrete blocking problems from optional suggestions.
+Consider Codex's fixes and rebuttals in good faith; do not repeat a disputed finding without
+addressing its evidence. Style preferences and optional improvements do not block approval.
+
+End your response with exactly one of these lines:
+TINCAN_VERDICT: APPROVED
+TINCAN_VERDICT: CHANGES_REQUESTED
+
+Use APPROVED when no blocking findings remain.
+"""
+
+
+def handle_visible_handoff(
+    root: Path, git_dir: Path, event: dict[str, Any], token: str
+) -> dict[str, Any]:
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        return {}
+    session_path = git_dir / "tincan" / "pane-sessions" / f"{token}.json"
+    session = load_json(session_path)
+    if (
+        not session.get("enabled")
+        or session.get("session_token") != token
+        or session.get("repo") != str(root)
+        or session.get("status") != "awaiting-codex"
+    ):
+        return {}
+
+    round_number = int(session.get("round", 0)) + 1
+    max_rounds = int(session.get("max_rounds", 5))
+    if round_number > max_rounds:
+        session.update(enabled=False, status="needs-human")
+        save_json(session_path, session)
+        return {
+            "systemMessage": (
+                f"Tincan reached its {max_rounds}-round limit. A human should adjudicate."
+            )
+        }
+
+    pane = os.environ.get(
+        "TINCAN_PANE", str(Path(__file__).resolve().with_name("tincan-pane"))
+    )
+    command = [
+        pane,
+        "send",
+        "--repo",
+        str(root),
+        "--session",
+        token,
+        "--wait",
+        "5",
+    ]
+    session["status"] = "awaiting-claude"
+    session["round"] = round_number
+    session["codex_session_id"] = event.get("session_id")
+    save_json(session_path, session)
+    result = subprocess.run(
+        command,
+        input=visible_review_prompt(root, event, round_number),
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        session.update(enabled=False, status="codex-handoff-failed")
+        save_json(session_path, session)
+        return {
+            "systemMessage": (
+                "Tincan could not send this turn to the visible Claude pane. "
+                f"The Codex turn was not blocked. Details: {detail}"
+            )
+        }
+
+    session["handoffs"] = int(session.get("handoffs", 0)) + 1
+    session["last_handoff_at"] = utc_now()
+    save_json(session_path, session)
+    return {
+        "systemMessage": (
+            f"Tincan sent this completed turn to the visible Claude pane for review round "
+            f"{round_number}."
+        )
+    }
+
+
+def git_snapshot(root: Path, base_commit: str | None, limit: int = 80_000) -> str:
+    status = subprocess.run(
+        ["git", "status", "--short", "--untracked-files=normal"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+    )
+    diff_args = ["git", "diff", "--no-ext-diff", "--unified=40"]
+    if base_commit:
+        diff_args.append(base_commit)
+    diff_args.append("--")
+    diff = subprocess.run(diff_args, cwd=root, text=True, capture_output=True)
+    body = (
+        "git status --short:\n"
+        + (status.stdout or status.stderr or "(clean)")
+        + "\nTracked diff from the original base:\n"
+        + (diff.stdout or diff.stderr or "(none)")
+    )
+    if len(body) > limit:
+        body = body[:limit] + "\n[diff snapshot truncated; inspect relevant files directly]\n"
+    return body
+
+
+def reviewer_prompt(state: dict[str, Any], event: dict[str, Any], round_number: int) -> str:
+    goal = state.get("task_context") or state.get("task_label") or "The task in the Codex chat"
+    return f"""You are the independent, read-only reviewer in an automated Codex/Claude loop.
+
+Repository: {state.get('repo')}
+Original base commit: {state.get('base_commit')}
+Review round: {round_number}
+
+Goal and acceptance context:
+{goal}
+
+Codex's latest report:
+{event.get('last_assistant_message') or '(no final report was provided)'}
+
+Repository snapshot captured by Tincan:
+{git_snapshot(Path(state['repo']), state.get('base_commit'))}
+
+Inspect the repository and all changes since the base commit, including untracked files. Read the
+relevant surrounding code and any untracked files; do not rely only on Codex's report or the
+snapshot. Also read applicable AGENTS.md and CLAUDE.md files if present. Run focused verification
+when useful, using one allowed command at a time without shell chaining. Do not edit files, change
+git state, install dependencies, or access secrets/network.
+
+Mark a finding blocking only for a concrete correctness, security, data-loss, regression, test, or
+stated-requirement problem that should prevent completion. Suggestions must not prevent approval.
+Use exact file and line locations when possible. If there are no blocking findings, verdict must be
+approved. Return only the requested structured result.
+"""
+
+
+def render_claude_event(event: dict[str, Any], log: TextIO) -> None:
+    kind = event.get("type")
+    if kind == "system" and event.get("subtype") == "init":
+        log.write(f"[claude session] {event.get('session_id', 'unknown')}\n")
+    elif kind == "rate_limit_event" or (
+        kind == "system" and event.get("subtype") == "thinking_tokens"
+    ):
+        return
+    elif kind == "assistant":
+        for block in (event.get("message") or {}).get("content") or []:
+            block_type = block.get("type")
+            if block_type == "text" and block.get("text"):
+                log.write(f"[claude] {block['text']}\n")
+            elif block_type == "tool_use":
+                detail = json.dumps(block.get("input"), ensure_ascii=False, sort_keys=True)
+                log.write(f"[claude tool] {block.get('name')} {detail}\n")
+    elif kind == "user":
+        for block in (event.get("message") or {}).get("content") or []:
+            if block.get("type") == "tool_result":
+                body = block.get("content", "")
+                if not isinstance(body, str):
+                    body = json.dumps(body, ensure_ascii=False)
+                log.write(f"[tool result]\n{body}\n")
+    elif kind == "result":
+        log.write(
+            f"[claude result] subtype={event.get('subtype')} "
+            f"turns={event.get('num_turns', '?')} cost=${event.get('total_cost_usd', '?')}\n"
+        )
+    else:
+        log.write(f"[claude event] {json.dumps(event, ensure_ascii=False)}\n")
+    log.flush()
+
+
+def parse_structured(result_event: dict[str, Any]) -> dict[str, Any] | None:
+    structured = result_event.get("structured_output")
+    if isinstance(structured, dict):
+        return structured
+    raw = result_event.get("result")
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def run_claude(
+    root: Path, state: dict[str, Any], event: dict[str, Any], round_number: int, log_path: Path
+) -> tuple[int, dict[str, Any] | None, str | None, str]:
+    executable = os.environ.get("TINCAN_CLAUDE", "claude")
+    args = [
+        executable,
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--safe-mode",
+        "--permission-mode",
+        "dontAsk",
+        "--permission-prompts",
+        "none",
+        "--tools",
+        "Read,Glob,Grep,Bash",
+        "--allowedTools",
+        (
+            "Read,Glob,Grep,Bash(git diff *),Bash(git status *),Bash(git log *),"
+            "Bash(git show *),Bash(git rev-parse *),Bash(git ls-files *),"
+            "Bash(npm test *),Bash(npm run test *),Bash(npm run typecheck *),"
+            "Bash(npm run lint *),Bash(npm run check *),Bash(node --test *),"
+            "Bash(pytest *),Bash(cargo test *),Bash(go test *),Bash(swift test *)"
+        ),
+        "--json-schema",
+        json.dumps(SCHEMA, separators=(",", ":")),
+    ]
+    if state.get("claude_session_id"):
+        args.extend(["--resume", state["claude_session_id"]])
+    args.append(reviewer_prompt(state, event, round_number))
+
+    raw_path = Path(state["run_dir"]) / f"claude-round-{round_number}.jsonl"
+    result_event: dict[str, Any] = {}
+    session_id: str | None = None
+    errors: list[str] = []
+    try:
+        process = subprocess.Popen(
+            args,
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as exc:
+        return 127, None, None, str(exc)
+
+    assert process.stdout is not None
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def interrupted(_signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        with raw_path.open("a") as raw, log_path.open("a") as log:
+            for line in process.stdout:
+                raw.write(line)
+                raw.flush()
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    errors.append(line.strip())
+                    log.write(f"[claude stderr] {line}")
+                    log.flush()
+                    continue
+                render_claude_event(message, log)
+                if message.get("session_id"):
+                    session_id = message["session_id"]
+                if message.get("type") == "result":
+                    result_event = message
+        return_code = process.wait()
+    except KeyboardInterrupt:
+        errors.append("Claude review was interrupted")
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        return_code = 130
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+    return return_code, parse_structured(result_event), session_id, "\n".join(errors[-10:])
+
+
+def format_review(review: dict[str, Any]) -> str:
+    lines = [f"Claude review: {review.get('verdict', 'unknown')}", review.get("summary", "")]
+    for index, finding in enumerate(review.get("findings") or [], 1):
+        location = finding.get("file") or "repository"
+        if finding.get("line") is not None:
+            location += f":{finding['line']}"
+        lines.append(
+            f"{index}. {str(finding.get('severity', 'blocking')).upper()} "
+            f"{finding.get('title', 'Finding')} ({location})\n{finding.get('details', '')}"
+        )
+    verification = review.get("verification") or []
+    if verification:
+        lines.append("Reviewer verification:\n- " + "\n- ".join(map(str, verification)))
+    return "\n\n".join(line for line in lines if line)
+
+
+def main() -> int:
+    try:
+        event = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        emit({"systemMessage": "Tincan received invalid Stop-hook input; review was skipped."})
+        return 0
+
+    paths = git_paths(Path(event.get("cwd") or os.getcwd()))
+    if not paths:
+        emit({})
+        return 0
+    root, git_dir = paths
+    pane_session = os.environ.get("TINCAN_SESSION")
+    if pane_session:
+        emit(handle_visible_handoff(root, git_dir, event, pane_session))
+        return 0
+
+    state_path = git_dir / "tincan" / "state.json"
+    state = load_json(state_path)
+    if not state.get("enabled"):
+        emit({})
+        return 0
+
+    # A clarification or planning turn should not consume a one-shot review gate.
+    # Wait until the repository actually differs from the recorded base.
+    if not has_changes(root, state.get("base_commit")):
+        emit({})
+        return 0
+
+    session_id = event.get("session_id")
+    if state.get("session_id") and state["session_id"] != session_id:
+        emit({})
+        return 0
+    if not state.get("session_id"):
+        state["session_id"] = session_id
+        state["status"] = "reviewing"
+
+    round_number = int(state.get("round", 0)) + 1
+    max_rounds = int(state.get("max_rounds", 5))
+    log_path = Path(state["log_path"])
+    if round_number > max_rounds:
+        state.update(enabled=False, status="needs-human", stopped_at=utc_now())
+        save_json(state_path, state)
+        emit(
+            {
+                "systemMessage": (
+                    f"Tincan stopped after {max_rounds} review rounds. "
+                    "A human should resolve the remaining disagreement."
+                )
+            }
+        )
+        return 0
+
+    state["round"] = round_number
+    state["status"] = "reviewing"
+    save_json(state_path, state)
+    append_log(log_path, f"\n=== REVIEW ROUND {round_number} ({utc_now()}) ===\n")
+
+    code, review, claude_session, error_text = run_claude(
+        root, state, event, round_number, log_path
+    )
+
+    # `tincan stop` or a newly armed run wins over an in-flight older review.
+    current_state = load_json(state_path)
+    if (
+        not current_state.get("enabled")
+        or current_state.get("run_dir") != state.get("run_dir")
+    ):
+        append_log(log_path, "[tincan] Review result ignored because the gate changed.\n")
+        emit({"systemMessage": "Tincan was stopped or re-armed while Claude was reviewing."})
+        return 0
+
+    if claude_session:
+        state["claude_session_id"] = claude_session
+
+    if code or not review:
+        state.update(enabled=False, status="review-failed", stopped_at=utc_now())
+        save_json(state_path, state)
+        detail = error_text or f"Claude exited {code} without a structured review."
+        append_log(log_path, f"[tincan] REVIEW FAILED: {detail}\n")
+        emit(
+            {
+                "decision": "block",
+                "reason": (
+                    "The independent Claude review could not run, so this work is unreviewed. "
+                    f"Tell the user and stop. Details: {detail}"
+                ),
+            }
+        )
+        return 0
+
+    rendered = format_review(review)
+    append_log(log_path, f"\n{rendered}\n")
+    state["last_review"] = review
+    state["last_review_hash"] = hashlib.sha256(
+        json.dumps(review, sort_keys=True).encode()
+    ).hexdigest()
+
+    blockers = [
+        finding
+        for finding in review.get("findings") or []
+        if finding.get("severity") == "blocking"
+    ]
+    if review.get("verdict") == "approved" and not blockers:
+        state.update(enabled=False, status="approved", approved_at=utc_now())
+        save_json(state_path, state)
+        emit({"systemMessage": f"Claude approved the work in review round {round_number}."})
+        return 0
+
+    state["status"] = "changes-requested"
+    save_json(state_path, state)
+    emit(
+        {
+            "decision": "block",
+            "reason": (
+                rendered
+                + "\n\nAddress every BLOCKING finding, verify the changes, and then finish again. "
+                "You may dispute a finding with concrete repository evidence; the next review "
+                "will adjudicate it. Suggestions are optional."
+            ),
+        }
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
