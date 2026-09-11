@@ -32,6 +32,12 @@ Give Codex a normal task; do not mention handoffs or reviewers. For example:
 > Implement the requested change. When finished, summarize what changed and the
 > verification you ran.
 
+For implementation tasks, Tincan tells Codex to inspect the Git state and move
+off the repository's default branch before editing. Codex chooses a meaningful
+branch from the task rather than using a generic session name. Existing work is
+preserved, and explicit user directions or repository-specific `AGENTS.md` rules
+take precedence when they call for a different branching workflow.
+
 No separate arming command or issue number is required. The first launch in a
 repository installs a local Codex Stop hook. Codex may ask you to trust that hook
 once.

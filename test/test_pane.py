@@ -28,16 +28,21 @@ class PaneControlTests(unittest.TestCase):
         encoded = PANE_MODULE.encoded_prompt("first\nsecond")
         self.assertEqual(encoded, b"\x1b[200~first\nsecond\x1b[201~\r")
 
-    def test_codex_uses_automatic_approval_review(self):
+    def test_codex_uses_automatic_approval_review_and_branch_guidance(self):
         repo = ROOT.resolve()
         with mock.patch.object(PANE_MODULE, "run_agent", return_value=0) as run_agent:
             result = PANE_MODULE.run_codex(repo, "a" * 32)
 
         self.assertEqual(result, 0)
-        self.assertEqual(
-            run_agent.call_args.args,
-            (repo, "a" * 32, "codex", ["codex", "--approve-for-me"]),
+        args = run_agent.call_args.args
+        self.assertEqual(args[:3], (repo, "a" * 32, "codex"))
+        self.assertEqual(args[3][:3], ["codex", "--approve-for-me", "-c"])
+        self.assertIn(
+            "Do not implement directly on the repository's default branch",
+            args[3][3],
         )
+        self.assertIn("AGENTS.md", args[3][3])
+        self.assertIn("Preserve all existing changes", args[3][3])
 
     def test_claude_uses_auto_permission_mode(self):
         repo = ROOT.resolve()

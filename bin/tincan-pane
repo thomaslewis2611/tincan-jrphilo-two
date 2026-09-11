@@ -22,6 +22,9 @@ import time
 import tty
 
 
+CODEX_DEVELOPER_INSTRUCTIONS = """Before making implementation changes, inspect the current Git branch and worktree. Do not implement directly on the repository's default branch. If you are on the default branch and the current worktree can safely move with the task, create or switch to a concise, meaningful task branch before editing. Preserve all existing changes: never discard, overwrite, or silently absorb unrelated work. Follow applicable repository instructions (including AGENTS.md) and explicit user directions when they require a different branching workflow."""
+
+
 def fail(message: str) -> "NoReturn":
     print(f"tincan: {message}", file=sys.stderr)
     raise SystemExit(2)
@@ -262,7 +265,15 @@ def run_claude(repo: Path, session: str | None) -> int:
 
 
 def run_codex(repo: Path, session: str) -> int:
-    return run_agent(repo, session, "codex", ["codex", "--approve-for-me"])
+    developer_instructions = (
+        f"developer_instructions={json.dumps(CODEX_DEVELOPER_INSTRUCTIONS)}"
+    )
+    return run_agent(
+        repo,
+        session,
+        "codex",
+        ["codex", "--approve-for-me", "-c", developer_instructions],
+    )
 
 
 def send_prompt(
