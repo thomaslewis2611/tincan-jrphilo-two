@@ -273,6 +273,94 @@ class ReviewHookIntegrationTests(unittest.TestCase):
         self.assertEqual(session["status"], "awaiting-claude")
         self.assertEqual(session["codex_session_id"], "visible-codex")
 
+    def test_approved_summary_rearms_panes_without_triggering_review(self):
+        token = "c" * 32
+        repo = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=self.root,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        sessions = self.git_dir / "tincan" / "pane-sessions"
+        sessions.mkdir(parents=True)
+        session_path = sessions / f"{token}.json"
+        session_path.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "repo": repo,
+                    "session_token": token,
+                    "status": "awaiting-codex-summary",
+                    "handoffs": 2,
+                    "round": 2,
+                    "cycle": 1,
+                    "max_rounds": 5,
+                }
+            )
+        )
+        prompt_path = self.git_dir / "unexpected-review-prompt.txt"
+        fake_pane = self.git_dir / "fake-pane"
+        fake_pane.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, sys\n"
+            "pathlib.Path(os.environ['FAKE_PANE_PROMPT']).write_text(sys.stdin.read())\n"
+        )
+        fake_pane.chmod(0o755)
+        environment = os.environ.copy()
+        environment["TINCAN_SESSION"] = token
+        environment["TINCAN_PANE"] = str(fake_pane)
+        environment["FAKE_PANE_PROMPT"] = str(prompt_path)
+
+        result = subprocess.run(
+            [str(HOOK)],
+            cwd=self.root,
+            input=json.dumps(
+                {
+                    "cwd": str(self.root),
+                    "session_id": "visible-codex",
+                    "last_assistant_message": "The work is approved and ready.",
+                }
+            ),
+            text=True,
+            capture_output=True,
+            env=environment,
+            check=True,
+        )
+
+        output = json.loads(result.stdout)
+        session = json.loads(session_path.read_text())
+        self.assertIn("ready for another Codex task", output["systemMessage"])
+        self.assertFalse(prompt_path.exists())
+        self.assertTrue(session["enabled"])
+        self.assertEqual(session["status"], "awaiting-codex")
+        self.assertEqual(session["round"], 0)
+        self.assertEqual(session["cycle"], 2)
+
+        follow_on = subprocess.run(
+            [str(HOOK)],
+            cwd=self.root,
+            input=json.dumps(
+                {
+                    "cwd": str(self.root),
+                    "session_id": "visible-codex",
+                    "last_assistant_message": "Completed the follow-on task.",
+                }
+            ),
+            text=True,
+            capture_output=True,
+            env=environment,
+            check=True,
+        )
+
+        follow_on_output = json.loads(follow_on.stdout)
+        session = json.loads(session_path.read_text())
+        self.assertIn("review round 1", follow_on_output["systemMessage"])
+        self.assertIn("Completed the follow-on task.", prompt_path.read_text())
+        self.assertEqual(session["status"], "awaiting-claude")
+        self.assertEqual(session["round"], 1)
+        self.assertEqual(session["cycle"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

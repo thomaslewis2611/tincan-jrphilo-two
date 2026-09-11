@@ -5,8 +5,9 @@ work and review feedback between their real interactive terminal UIs.
 
 Codex remains the implementation lead. Claude reviews the shared checkout. A
 blocking finding goes back to Codex, which may fix it or rebut it with evidence;
-Claude then reviews again. Approval ends the loop. Five unresolved rounds escalate
-to the human by default.
+Claude then reviews again. Approval ends the current review cycle; after Codex
+reports the approved result, the same panes wait for another task. Five unresolved
+rounds escalate to the human by default.
 
 ## Quick start
 
@@ -64,11 +65,16 @@ The visible loop is:
 ```text
 Codex completes a turn
   -> Claude reviews the current checkout
-     -> APPROVED: return the result to Codex and stop
+     -> APPROVED: return the result to Codex and complete this cycle
      -> CHANGES_REQUESTED: return findings to Codex
         -> Codex fixes or rebuts
            -> Claude re-reviews
 ```
+
+After an approval, Codex visibly summarizes the result as usual. Tincan does not
+send that approval summary back for redundant review. Instead, it resets the round
+counter and waits. The next task you enter in the same Codex pane begins a fresh
+review cycle automatically; reopening Tincan is unnecessary.
 
 If Claude omits its machine-readable verdict, a handoff fails, or the round limit
 is reached, Tincan stops the loop instead of treating the work as approved.

@@ -104,6 +104,7 @@ def create_session(repo: Path, token: str, max_rounds: int) -> Path:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "handoffs": 0,
         "round": 0,
+        "cycle": 1,
         "max_rounds": max_rounds,
         "claude_settings": str(settings_path),
     }

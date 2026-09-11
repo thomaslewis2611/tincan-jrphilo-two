@@ -76,7 +76,7 @@ class ClaudeHookIntegrationTests(unittest.TestCase):
         )
         return json.loads(result.stdout), json.loads(self.session_path.read_text())
 
-    def test_approval_returns_to_codex_and_stops_loop(self):
+    def test_approval_returns_to_codex_and_waits_for_its_summary(self):
         output, session = self.invoke(
             "No blocking findings.\n\nTINCAN_VERDICT: APPROVED"
         )
@@ -84,8 +84,8 @@ class ClaudeHookIntegrationTests(unittest.TestCase):
         self.assertIn("approved review round 1", output["systemMessage"])
         self.assertIn("No blocking findings.", self.prompt_path.read_text())
         self.assertEqual(pane_args[pane_args.index("--agent") + 1], "codex")
-        self.assertFalse(session["enabled"])
-        self.assertEqual(session["status"], "approved")
+        self.assertTrue(session["enabled"])
+        self.assertEqual(session["status"], "awaiting-codex-summary")
         self.assertEqual(session["handoffs"], 2)
         self.assertEqual(session["claude_session_id"], "visible-claude")
 

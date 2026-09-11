@@ -143,11 +143,26 @@ def handle_visible_handoff(
     session_path = git_dir / "tincan" / "pane-sessions" / f"{token}.json"
     session = load_json(session_path)
     if (
-        not session.get("enabled")
-        or session.get("session_token") != token
+        session.get("session_token") != token
         or session.get("repo") != str(root)
-        or session.get("status") != "awaiting-codex"
     ):
+        return {}
+
+    if session.get("enabled") and session.get("status") == "awaiting-codex-summary":
+        session.update(
+            status="awaiting-codex",
+            round=0,
+            cycle=int(session.get("cycle", 1)) + 1,
+        )
+        save_json(session_path, session)
+        return {
+            "systemMessage": (
+                "Tincan completed the approved review cycle and is ready for another "
+                "Codex task in these panes."
+            )
+        }
+
+    if not session.get("enabled") or session.get("status") != "awaiting-codex":
         return {}
 
     round_number = int(session.get("round", 0)) + 1
