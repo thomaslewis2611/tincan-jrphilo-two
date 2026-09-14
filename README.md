@@ -74,7 +74,17 @@ Codex completes a turn
 After an approval, Codex visibly summarizes the result as usual. Tincan does not
 send that approval summary back for redundant review. Instead, it resets the round
 counter and waits. The next task you enter in the same Codex pane begins a fresh
-review cycle automatically; reopening Tincan is unnecessary.
+review cycle automatically when it changes checked-out content; reopening Tincan
+is unnecessary. Administrative follow-ups such as committing, switching branches,
+pushing, or opening a pull request do not trigger another review when the approved
+file contents remain unchanged.
+
+After the first approval in a cycle, Codex automatically assesses Claude's optional
+suggestions. It may implement a suggestion only when it is clearly useful, in scope,
+small, low-risk, and directly verifiable; otherwise it briefly defers or declines it.
+If that triage changes checked-out content, Claude reviews the result. Tincan offers
+this optional-improvement pass only once so approval cannot become an endless polish
+loop.
 
 If Claude omits its machine-readable verdict, a handoff fails, or the round limit
 is reached, Tincan stops the loop instead of treating the work as approved.

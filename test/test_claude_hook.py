@@ -40,20 +40,27 @@ class ClaudeHookIntegrationTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def invoke(self, message: str, round_number: int = 1, max_rounds: int = 5):
-        self.session_path.write_text(
-            json.dumps(
-                {
-                    "enabled": True,
-                    "repo": self.repo,
-                    "session_token": self.token,
-                    "status": "awaiting-claude",
-                    "handoffs": 1,
-                    "round": round_number,
-                    "max_rounds": max_rounds,
-                }
-            )
-        )
+    def invoke(
+        self,
+        message: str,
+        round_number: int = 1,
+        max_rounds: int = 5,
+        review_kind: str = "task",
+        review_fingerprint: str | None = "reviewed-content",
+    ):
+        session = {
+            "enabled": True,
+            "repo": self.repo,
+            "session_token": self.token,
+            "status": "awaiting-claude",
+            "handoffs": 1,
+            "round": round_number,
+            "max_rounds": max_rounds,
+            "review_kind": review_kind,
+        }
+        if review_fingerprint:
+            session["review_content_fingerprint"] = review_fingerprint
+        self.session_path.write_text(json.dumps(session))
         environment = os.environ.copy()
         environment["TINCAN_SESSION"] = self.token
         environment["TINCAN_PANE"] = str(self.fake_pane)
@@ -88,6 +95,37 @@ class ClaudeHookIntegrationTests(unittest.TestCase):
         self.assertEqual(session["status"], "awaiting-codex-summary")
         self.assertEqual(session["handoffs"], 2)
         self.assertEqual(session["claude_session_id"], "visible-claude")
+        self.assertEqual(session["approved_content_fingerprint"], "reviewed-content")
+        self.assertIn("assess any optional suggestions", self.prompt_path.read_text())
+
+    def test_followup_approval_finishes_without_another_optional_pass(self):
+        _output, session = self.invoke(
+            "The follow-up is sound. Another minor idea remains.\n\n"
+            "TINCAN_VERDICT: APPROVED",
+            round_number=2,
+            review_kind="followup",
+        )
+
+        prompt = self.prompt_path.read_text()
+        self.assertIn("Do not continue into another round", prompt)
+        self.assertNotIn("assess any optional suggestions", prompt)
+
+    def test_approval_at_round_limit_does_not_offer_unreviewable_followups(self):
+        _output, session = self.invoke(
+            "No blockers remain.\n\nTINCAN_VERDICT: APPROVED",
+            round_number=1,
+            max_rounds=1,
+        )
+
+        self.assertIn("Do not continue into another round", self.prompt_path.read_text())
+
+    def test_approval_without_content_baseline_does_not_offer_followups(self):
+        self.invoke(
+            "No blockers remain.\n\nTINCAN_VERDICT: APPROVED",
+            review_fingerprint=None,
+        )
+
+        self.assertIn("Do not continue into another round", self.prompt_path.read_text())
 
     def test_changes_requested_returns_to_codex_and_keeps_loop_open(self):
         output, session = self.invoke(

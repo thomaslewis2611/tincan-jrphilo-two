@@ -59,13 +59,27 @@ def parse_verdict(message: str) -> str | None:
 
 
 def codex_prompt(
-    event: dict[str, Any], round_number: int, verdict: str | None, at_limit: bool
+    event: dict[str, Any],
+    round_number: int,
+    verdict: str | None,
+    at_limit: bool,
+    triage_followups: bool,
 ) -> str:
     review = event.get("last_assistant_message") or "(Claude supplied no final review text.)"
-    if verdict == "APPROVED":
+    if verdict == "APPROVED" and triage_followups:
         instruction = (
-            "Claude found no blocking issues. Optional suggestions do not require changes. "
-            "Briefly summarize the approved result for the user and stop."
+            "Claude found no blocking issues. Before finalizing, assess any optional suggestions "
+            "in the review. Implement one now only when it is clearly in scope, materially useful, "
+            "small and low-risk, and directly verifiable. Briefly defer or decline the rest, "
+            "especially style-only or scope-expanding suggestions. Verify any edits, summarize "
+            "your decisions for the user, and stop. Tincan will automatically review any content "
+            "changes."
+        )
+    elif verdict == "APPROVED":
+        instruction = (
+            "Claude found no blocking issues. Do not continue into another round of optional "
+            "polishing. Briefly summarize the final approved result and any deferred suggestions "
+            "for the user, then stop."
         )
     elif at_limit:
         instruction = (
@@ -124,6 +138,12 @@ def main() -> int:
     round_number = int(session.get("round", 1))
     max_rounds = int(session.get("max_rounds", 5))
     at_limit = verdict == "CHANGES_REQUESTED" and round_number >= max_rounds
+    triage_followups = (
+        verdict == "APPROVED"
+        and bool(session.get("review_content_fingerprint"))
+        and session.get("review_kind", "task") != "followup"
+        and round_number < max_rounds
+    )
 
     if verdict == "CHANGES_REQUESTED" and not at_limit:
         next_status = "awaiting-codex"
@@ -131,6 +151,10 @@ def main() -> int:
     elif verdict == "APPROVED":
         next_status = "awaiting-codex-summary"
         enabled = True
+        if session.get("review_content_fingerprint"):
+            session["approved_content_fingerprint"] = session[
+                "review_content_fingerprint"
+            ]
     else:
         next_status = "needs-human"
         enabled = False
@@ -159,7 +183,9 @@ def main() -> int:
             "--wait",
             "5",
         ],
-        input=codex_prompt(event, round_number, verdict, at_limit),
+        input=codex_prompt(
+            event, round_number, verdict, at_limit, triage_followups
+        ),
         text=True,
         capture_output=True,
     )
@@ -178,9 +204,13 @@ def main() -> int:
     )
     save_json(session_path, session)
     if next_status == "awaiting-codex-summary":
-        detail = (
-            f"Claude approved review round {round_number}; Tincan completed this review cycle."
-        )
+        if triage_followups:
+            detail = (
+                f"Claude approved review round {round_number}; Tincan returned the approved "
+                "review to Codex for one-pass follow-up triage."
+            )
+        else:
+            detail = f"Claude approved review round {round_number}; Codex is finalizing."
     elif next_status == "awaiting-codex":
         detail = f"Claude requested changes in round {round_number}; Tincan returned them to Codex."
     else:

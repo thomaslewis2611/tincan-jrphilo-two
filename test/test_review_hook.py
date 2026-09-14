@@ -127,6 +127,36 @@ class ReviewHookIntegrationTests(unittest.TestCase):
         (self.root / "new-file.txt").write_text("new\n")
         self.assertTrue(MODULE.has_changes(self.root, base))
 
+    def test_content_fingerprint_ignores_branch_commit_and_index_changes(self):
+        (self.root / "README.md").write_text("approved content\n")
+        approved = MODULE.content_fingerprint(self.root)
+
+        subprocess.run(["git", "switch", "-c", "administrative"], cwd=self.root, check=True)
+        subprocess.run(["git", "add", "README.md"], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", "approved content"], cwd=self.root, check=True)
+
+        self.assertEqual(MODULE.content_fingerprint(self.root), approved)
+
+        (self.root / "README.md").unlink()
+        approved_deletion = MODULE.content_fingerprint(self.root)
+        subprocess.run(["git", "add", "--all"], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", "approved deletion"], cwd=self.root, check=True)
+
+        self.assertEqual(MODULE.content_fingerprint(self.root), approved_deletion)
+
+    def test_content_fingerprint_detects_tracked_and_untracked_changes(self):
+        baseline = MODULE.content_fingerprint(self.root)
+        (self.root / "README.md").write_text("changed\n")
+        tracked = MODULE.content_fingerprint(self.root)
+        (self.root / "new-file.txt").write_text("new\n")
+
+        self.assertNotEqual(tracked, baseline)
+        self.assertNotEqual(MODULE.content_fingerprint(self.root), tracked)
+
+        (self.root / "new-file.txt").unlink()
+        (self.root / "README.md").unlink()
+        self.assertNotEqual(MODULE.content_fingerprint(self.root), baseline)
+
     def invoke(self, review):
         (self.root / "README.md").write_text("test\nchanged\n")
         state = {
@@ -273,7 +303,67 @@ class ReviewHookIntegrationTests(unittest.TestCase):
         self.assertEqual(session["status"], "awaiting-claude")
         self.assertEqual(session["codex_session_id"], "visible-codex")
 
-    def test_approved_summary_rearms_panes_without_triggering_review(self):
+    def test_unchanged_rebuttal_during_review_returns_to_claude(self):
+        token = "d" * 32
+        repo = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=self.root,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        sessions = self.git_dir / "tincan" / "pane-sessions"
+        sessions.mkdir(parents=True)
+        session_path = sessions / f"{token}.json"
+        session_path.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "repo": repo,
+                    "session_token": token,
+                    "status": "awaiting-codex",
+                    "round": 1,
+                    "max_rounds": 5,
+                    "approved_content_fingerprint": MODULE.content_fingerprint(self.root),
+                }
+            )
+        )
+        prompt_path = self.git_dir / "rebuttal-prompt.txt"
+        fake_pane = self.git_dir / "fake-pane"
+        fake_pane.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, sys\n"
+            "pathlib.Path(os.environ['FAKE_PANE_PROMPT']).write_text(sys.stdin.read())\n"
+        )
+        fake_pane.chmod(0o755)
+        environment = os.environ.copy()
+        environment["TINCAN_SESSION"] = token
+        environment["TINCAN_PANE"] = str(fake_pane)
+        environment["FAKE_PANE_PROMPT"] = str(prompt_path)
+
+        result = subprocess.run(
+            [str(HOOK)],
+            cwd=self.root,
+            input=json.dumps(
+                {
+                    "cwd": str(self.root),
+                    "session_id": "visible-codex",
+                    "last_assistant_message": "The existing code disproves the finding.",
+                }
+            ),
+            text=True,
+            capture_output=True,
+            env=environment,
+            check=True,
+        )
+
+        output = json.loads(result.stdout)
+        session = json.loads(session_path.read_text())
+        self.assertIn("review round 2", output["systemMessage"])
+        self.assertIn("disproves the finding", prompt_path.read_text())
+        self.assertEqual(session["status"], "awaiting-claude")
+
+    def test_approved_summary_rearms_and_only_changed_followup_is_reviewed(self):
         token = "c" * 32
         repo = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -296,6 +386,7 @@ class ReviewHookIntegrationTests(unittest.TestCase):
                     "round": 2,
                     "cycle": 1,
                     "max_rounds": 5,
+                    "approved_content_fingerprint": MODULE.content_fingerprint(self.root),
                 }
             )
         )
@@ -353,13 +444,104 @@ class ReviewHookIntegrationTests(unittest.TestCase):
             check=True,
         )
 
-        follow_on_output = json.loads(follow_on.stdout)
+        unchanged_output = json.loads(follow_on.stdout)
+        session = json.loads(session_path.read_text())
+        self.assertIn("checked-out content has not changed", unchanged_output["systemMessage"])
+        self.assertFalse(prompt_path.exists())
+        self.assertEqual(session["status"], "awaiting-codex")
+        self.assertEqual(session["round"], 0)
+
+        (self.root / "README.md").write_text("test\nfollow-up\n")
+        changed_follow_on = subprocess.run(
+            [str(HOOK)],
+            cwd=self.root,
+            input=json.dumps(
+                {
+                    "cwd": str(self.root),
+                    "session_id": "visible-codex",
+                    "last_assistant_message": "Completed the changed follow-on task.",
+                }
+            ),
+            text=True,
+            capture_output=True,
+            env=environment,
+            check=True,
+        )
+
+        follow_on_output = json.loads(changed_follow_on.stdout)
         session = json.loads(session_path.read_text())
         self.assertIn("review round 1", follow_on_output["systemMessage"])
-        self.assertIn("Completed the follow-on task.", prompt_path.read_text())
+        self.assertIn("Completed the changed follow-on task.", prompt_path.read_text())
         self.assertEqual(session["status"], "awaiting-claude")
         self.assertEqual(session["round"], 1)
         self.assertEqual(session["cycle"], 2)
+
+    def test_changed_post_approval_triage_gets_one_followup_review(self):
+        token = "e" * 32
+        repo = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=self.root,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        sessions = self.git_dir / "tincan" / "pane-sessions"
+        sessions.mkdir(parents=True)
+        session_path = sessions / f"{token}.json"
+        session_path.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "repo": repo,
+                    "session_token": token,
+                    "status": "awaiting-codex-summary",
+                    "handoffs": 2,
+                    "round": 1,
+                    "cycle": 1,
+                    "max_rounds": 5,
+                    "review_kind": "task",
+                    "approved_content_fingerprint": MODULE.content_fingerprint(self.root),
+                }
+            )
+        )
+        prompt_path = self.git_dir / "followup-review-prompt.txt"
+        fake_pane = self.git_dir / "fake-pane"
+        fake_pane.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, sys\n"
+            "pathlib.Path(os.environ['FAKE_PANE_PROMPT']).write_text(sys.stdin.read())\n"
+        )
+        fake_pane.chmod(0o755)
+        environment = os.environ.copy()
+        environment["TINCAN_SESSION"] = token
+        environment["TINCAN_PANE"] = str(fake_pane)
+        environment["FAKE_PANE_PROMPT"] = str(prompt_path)
+        (self.root / "README.md").write_text("test\nworthwhile follow-up\n")
+
+        result = subprocess.run(
+            [str(HOOK)],
+            cwd=self.root,
+            input=json.dumps(
+                {
+                    "cwd": str(self.root),
+                    "session_id": "visible-codex",
+                    "last_assistant_message": "Implemented the worthwhile suggestion.",
+                }
+            ),
+            text=True,
+            capture_output=True,
+            env=environment,
+            check=True,
+        )
+
+        output = json.loads(result.stdout)
+        session = json.loads(session_path.read_text())
+        prompt = prompt_path.read_text()
+        self.assertIn("review round 2", output["systemMessage"])
+        self.assertIn("triaging optional suggestions", prompt)
+        self.assertEqual(session["status"], "awaiting-claude")
+        self.assertEqual(session["review_kind"], "followup")
+        self.assertEqual(session["cycle"], 1)
 
 
 if __name__ == "__main__":
