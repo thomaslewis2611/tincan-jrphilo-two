@@ -58,6 +58,25 @@ class PaneControlTests(unittest.TestCase):
             (repo, "a" * 32, "claude", ["claude", "--permission-mode", "auto"]),
         )
 
+    def test_brainstorm_agents_use_thinking_only_modes(self):
+        repo = ROOT.resolve()
+        state = {"mode": "brainstorm", "claude_settings": "/tmp/settings.json"}
+        with (
+            mock.patch.object(PANE_MODULE, "session_state", return_value=state),
+            mock.patch.object(PANE_MODULE, "run_agent", return_value=0) as run_agent,
+        ):
+            self.assertEqual(PANE_MODULE.run_claude(repo, "a" * 32), 0)
+            claude_argv = run_agent.call_args.args[3]
+            self.assertEqual(claude_argv[:3], ["claude", "--permission-mode", "plan"])
+            self.assertIn("--append-system-prompt", claude_argv)
+            self.assertIn("--settings", claude_argv)
+
+            self.assertEqual(PANE_MODULE.run_codex(repo, "a" * 32), 0)
+            codex_argv = run_agent.call_args.args[3]
+            self.assertEqual(codex_argv[:3], ["codex", "--sandbox", "read-only"])
+            self.assertIn("never", codex_argv)
+            self.assertIn("independent-first brainstorm", codex_argv[-1])
+
     def test_send_delivers_prompt_to_repo_socket(self):
         class FakeSocket:
             def __init__(self):

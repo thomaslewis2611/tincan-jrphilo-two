@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""Coordinate independent-first Codex and Claude brainstorming rounds."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+from typing import Any, Iterator
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def emit(value: dict[str, Any]) -> None:
+    print(json.dumps(value, separators=(",", ":")))
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_json(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+@contextmanager
+def locked_session(path: Path) -> Iterator[dict[str, Any]]:
+    lock_path = path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        session = load_json(path)
+        yield session
+        save_json(path, session)
+
+
+def git_paths(cwd: Path) -> tuple[Path, Path] | None:
+    root_result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+    )
+    if root_result.returncode:
+        return None
+    root = Path(root_result.stdout.strip()).resolve()
+    git_result = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-dir"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+    )
+    if git_result.returncode:
+        return None
+    return root, Path(git_result.stdout.strip()).resolve()
+
+
+def prompt_hash(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode()).hexdigest()
+
+
+def send_to_pane(root: Path, token: str, agent: str, prompt: str) -> str | None:
+    pane = os.environ.get(
+        "TINCAN_PANE", str(Path(__file__).resolve().with_name("tincan-pane"))
+    )
+    result = subprocess.run(
+        [
+            pane,
+            "send",
+            "--agent",
+            agent,
+            "--repo",
+            str(root),
+            "--session",
+            token,
+            "--wait",
+            "15",
+        ],
+        input=prompt,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode:
+        return (result.stderr or result.stdout).strip() or f"{agent} pane rejected prompt"
+    return None
+
+
+def independent_prompt(user_prompt: str, cycle: int) -> str:
+    return f"""Tincan brainstorm, cycle {cycle}: form your independent initial view.
+
+The user submitted the same prompt to you and Codex:
+
+---
+{user_prompt}
+---
+
+Develop your own view without anticipating Codex's answer. Be concrete, candid, and useful. Do not
+edit files or take external actions. Do not attempt a consensus yet; Tincan will share both initial
+views only after each is complete. Match the depth to the question. For a simple question, use at
+most 3 concise bullets or roughly 150 words; exceed that only when the substance truly requires it.
+"""
+
+
+def reflection_prompt(other_agent: str, other_view: str, cycle: int) -> str:
+    return f"""Tincan brainstorm, cycle {cycle}: independent views are now complete.
+
+Here is {other_agent}'s initial view:
+
+---
+{other_view}
+---
+
+Reconsider your own position in light of it. Report only the delta: what changed, one useful addition,
+or one material disagreement that remains. Do not recap either initial answer, manufacture consensus,
+or synthesize on behalf of both participants. For a simple question, use at most 3 short bullets or
+roughly 100 words. If nothing material changed, say so in one sentence.
+"""
+
+
+def synthesis_prompt(session: dict[str, Any]) -> str:
+    initial = session.get("initial") or {}
+    reflections = session.get("reflections") or {}
+    return f"""Tincan brainstorm, cycle {session.get('cycle', 1)}: synthesize the completed exchange.
+
+Original user prompt:
+---
+{session.get('user_prompt', '')}
+---
+
+Codex initial view:
+---
+{initial.get('codex', '')}
+---
+
+Claude initial view:
+---
+{initial.get('claude', '')}
+---
+
+Codex reconsideration:
+---
+{reflections.get('codex', '')}
+---
+
+Claude reconsideration:
+---
+{reflections.get('claude', '')}
+---
+
+Answer the user's original question directly. Compress rather than chronicle: do not recap the four
+preceding responses or describe the Tincan process. Include only the strongest conclusion, the most
+useful reasoning, and any unresolved disagreement that would actually affect the user's decision.
+For a simple question, aim for roughly 200 words or fewer. Expand only when the original question is
+genuinely complex. Do not imply agreement where it does not exist.
+"""
+
+
+def fail_cycle(session_path: Path, detail: str) -> dict[str, Any]:
+    with locked_session(session_path) as session:
+        session.update(status="awaiting-user", error=detail, failed_at=utc_now())
+        session.pop("pending_codex_prompt_hash", None)
+    return {
+        "decision": "block",
+        "reason": f"Tincan could not continue this brainstorm cycle: {detail}",
+    }
+
+
+def handle_user_prompt(
+    root: Path, session_path: Path, token: str, prompt: str
+) -> dict[str, Any]:
+    with locked_session(session_path) as session:
+        if session.get("mode") != "brainstorm" or not session.get("enabled"):
+            return {}
+        status = session.get("status", "awaiting-user")
+        pending = session.get("pending_codex_prompt_hash")
+        if pending and pending == prompt_hash(prompt):
+            session.pop("pending_codex_prompt_hash", None)
+            return {}
+        if status != "awaiting-user":
+            return {
+                "decision": "block",
+                "reason": (
+                    "Tincan is still completing the current independent brainstorm cycle. "
+                    "Wait for the synthesis before submitting another prompt."
+                ),
+            }
+
+        cycle = int(session.get("cycle", 0)) + 1
+        session.update(
+            status="independent",
+            cycle=cycle,
+            user_prompt=prompt,
+            initial={},
+            reflections={},
+            started_at=utc_now(),
+        )
+        session.pop("synthesis", None)
+        session.pop("error", None)
+
+    error = send_to_pane(root, token, "claude", independent_prompt(prompt, cycle))
+    if error:
+        return fail_cycle(session_path, error)
+    return {
+        "systemMessage": (
+            f"Tincan sent brainstorm cycle {cycle} to Claude; both independent views "
+            "are now running."
+        ),
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": (
+                "This is your independent first view in a Tincan brainstorm. Match depth "
+                "to the question. For a simple question, respond in at most 3 concise "
+                "bullets or roughly 150 words. Do not recap the process, anticipate "
+                "Claude, or attempt a synthesis yet."
+            ),
+        },
+    }
+
+
+def record_initial(
+    root: Path,
+    session_path: Path,
+    token: str,
+    agent: str,
+    message: str,
+) -> dict[str, Any]:
+    with locked_session(session_path) as session:
+        initial = session.setdefault("initial", {})
+        initial[agent] = message
+        if not all(initial.get(name) for name in ("codex", "claude")):
+            return {
+                "systemMessage": (
+                    f"Tincan captured {agent.title()}'s independent view and is waiting "
+                    "for the other participant."
+                )
+            }
+
+        cycle = int(session.get("cycle", 1))
+        codex_prompt = reflection_prompt("Claude", initial["claude"], cycle)
+        claude_prompt = reflection_prompt("Codex", initial["codex"], cycle)
+        session["status"] = "reflection"
+        if agent == "claude":
+            session["pending_codex_prompt_hash"] = prompt_hash(codex_prompt)
+
+    other_agent = "claude" if agent == "codex" else "codex"
+    other_prompt = claude_prompt if other_agent == "claude" else codex_prompt
+    error = send_to_pane(root, token, other_agent, other_prompt)
+    if error:
+        return fail_cycle(session_path, error)
+    own_prompt = codex_prompt if agent == "codex" else claude_prompt
+    return {
+        "decision": "block",
+        "reason": own_prompt,
+        "systemMessage": "Tincan exchanged both independent views for reconsideration.",
+    }
+
+
+def record_reflection(
+    root: Path,
+    session_path: Path,
+    token: str,
+    agent: str,
+    message: str,
+) -> dict[str, Any]:
+    with locked_session(session_path) as session:
+        reflections = session.setdefault("reflections", {})
+        reflections[agent] = message
+        if not all(reflections.get(name) for name in ("codex", "claude")):
+            return {
+                "systemMessage": (
+                    f"Tincan captured {agent.title()}'s reconsideration and is waiting "
+                    "for the other participant."
+                )
+            }
+
+        prompt = synthesis_prompt(session)
+        session["status"] = "synthesis"
+        if agent == "claude":
+            session["pending_codex_prompt_hash"] = prompt_hash(prompt)
+
+    if agent == "codex":
+        return {
+            "decision": "block",
+            "reason": prompt,
+            "systemMessage": "Both reconsiderations are complete; Codex is synthesizing.",
+        }
+
+    error = send_to_pane(root, token, "codex", prompt)
+    if error:
+        return fail_cycle(session_path, error)
+    return {"systemMessage": "Both reconsiderations are complete; Codex is synthesizing."}
+
+
+def handle_stop(
+    root: Path,
+    session_path: Path,
+    token: str,
+    agent: str,
+    event: dict[str, Any],
+) -> dict[str, Any]:
+    message = event.get("last_assistant_message") or "(No final response was supplied.)"
+    with locked_session(session_path) as session:
+        if session.get("mode") != "brainstorm" or not session.get("enabled"):
+            return {}
+        status = session.get("status")
+        session[f"{agent}_session_id"] = event.get("session_id")
+
+    if status == "independent":
+        return record_initial(root, session_path, token, agent, message)
+    if status == "reflection":
+        return record_reflection(root, session_path, token, agent, message)
+    if status == "synthesis" and agent == "codex":
+        with locked_session(session_path) as session:
+            session.update(
+                status="awaiting-user",
+                synthesis=message,
+                completed_at=utc_now(),
+            )
+            session.pop("pending_codex_prompt_hash", None)
+        return {
+            "systemMessage": (
+                f"Tincan completed brainstorm cycle {session.get('cycle', 1)} and is "
+                "ready for your next prompt."
+            )
+        }
+    return {}
+
+
+def main() -> int:
+    try:
+        event = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        emit({})
+        return 0
+
+    token = os.environ.get("TINCAN_SESSION", "")
+    agent = os.environ.get("TINCAN_AGENT", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", token) or agent not in ("codex", "claude"):
+        emit({})
+        return 0
+    paths = git_paths(Path(event.get("cwd") or os.getcwd()))
+    if not paths:
+        emit({})
+        return 0
+    root, git_dir = paths
+    session_path = git_dir / "tincan" / "pane-sessions" / f"{token}.json"
+    session = load_json(session_path)
+    if session.get("session_token") != token or session.get("repo") != str(root):
+        emit({})
+        return 0
+
+    event_name = event.get("hook_event_name") or event.get("hook_event")
+    if event_name == "UserPromptSubmit" and agent == "codex":
+        prompt = event.get("prompt")
+        output = handle_user_prompt(root, session_path, token, prompt) if prompt else {}
+    elif event_name == "Stop":
+        output = handle_stop(root, session_path, token, agent, event)
+    else:
+        output = {}
+    emit(output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

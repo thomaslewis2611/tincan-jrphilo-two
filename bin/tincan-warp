@@ -17,7 +17,6 @@ import tempfile
 
 
 CONFIG_STEM = "tincan_pair"
-HOOK_MARKER = "# tincan-review-gate"
 
 
 def fail(message: str) -> "NoReturn":
@@ -57,20 +56,20 @@ def git_dir(repo: Path) -> Path:
 
 
 def ensure_hook(repo: Path) -> None:
-    config = repo / ".codex" / "config.toml"
-    if config.exists() and HOOK_MARKER in config.read_text():
-        return
     control = Path(__file__).resolve().with_name("tincan-control")
     result = subprocess.run([str(control), "install", "--repo", str(repo)])
     if result.returncode:
         fail("could not install the Codex handoff hook; see the message above")
 
 
-def create_session(repo: Path, token: str, max_rounds: int) -> Path:
+def create_session(repo: Path, token: str, max_rounds: int, mode: str) -> Path:
     state_dir = git_dir(repo) / "tincan"
     sessions = state_dir / "pane-sessions"
     sessions.mkdir(parents=True, exist_ok=True)
-    claude_hook = Path(__file__).resolve().with_name("tincan-claude-hook")
+    hook_name = (
+        "tincan-brainstorm-hook" if mode == "brainstorm" else "tincan-claude-hook"
+    )
+    claude_hook = Path(__file__).resolve().with_name(hook_name)
     settings_path = sessions / f"{token}-claude-settings.json"
     settings_path.write_text(
         json.dumps(
@@ -83,7 +82,11 @@ def create_session(repo: Path, token: str, max_rounds: int) -> Path:
                                     "type": "command",
                                     "command": str(claude_hook),
                                     "timeout": 30,
-                                    "statusMessage": "Sending Claude's review to Codex",
+                                    "statusMessage": (
+                                        "Coordinating the brainstorm"
+                                        if mode == "brainstorm"
+                                        else "Sending Claude's review to Codex"
+                                    ),
                                 }
                             ]
                         }
@@ -97,14 +100,14 @@ def create_session(repo: Path, token: str, max_rounds: int) -> Path:
     )
     value = {
         "enabled": True,
-        "mode": "visible-review-loop",
+        "mode": mode,
         "repo": str(repo),
         "session_token": token,
-        "status": "awaiting-codex",
+        "status": "awaiting-user" if mode == "brainstorm" else "awaiting-codex",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "handoffs": 0,
         "round": 0,
-        "cycle": 1,
+        "cycle": 0 if mode == "brainstorm" else 1,
         "max_rounds": max_rounds,
         "claude_settings": str(settings_path),
     }
@@ -117,7 +120,7 @@ def create_session(repo: Path, token: str, max_rounds: int) -> Path:
     return session_path
 
 
-def render_config(repo: Path, session: str) -> str:
+def render_config(repo: Path, session: str, mode: str = "visible-review-loop") -> str:
     repo_text = str(repo)
     tincan = Path(__file__).resolve().with_name("tincan")
     codex_command = " ".join(
@@ -128,8 +131,9 @@ def render_config(repo: Path, session: str) -> str:
         shlex.quote(part)
         for part in (str(tincan), "claude-pane", "--repo", repo_text, "--session", session)
     )
-    return f'''name = "Tincan Pair"
-title = {toml_string(f"Tincan · {repo.name}")}
+    label = "Tincan Brainstorm" if mode == "brainstorm" else "Tincan Pair"
+    return f'''name = {toml_string(label)}
+title = {toml_string(f"{label} · {repo.name}")}
 color = "cyan"
 
 [[panes]]
@@ -152,7 +156,9 @@ commands = [{toml_string(claude_command)}]
 '''
 
 
-def write_config(repo: Path, session: str) -> Path:
+def write_config(
+    repo: Path, session: str, mode: str = "visible-review-loop"
+) -> Path:
     config_dir = Path(
         os.environ.get("TINCAN_WARP_CONFIG_DIR", "~/.warp/tab_configs")
     ).expanduser()
@@ -165,7 +171,7 @@ def write_config(repo: Path, session: str) -> Path:
     temporary = Path(temporary_name)
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            stream.write(render_config(repo, session))
+            stream.write(render_config(repo, session, mode))
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
@@ -198,6 +204,11 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="maximum Claude review rounds before asking a human (default: 5)",
     )
+    parser.add_argument(
+        "--brainstorm",
+        action="store_true",
+        help="run an independent-first Codex and Claude brainstorm",
+    )
     return parser.parse_args()
 
 
@@ -210,10 +221,11 @@ def main() -> int:
         fail(f"missing from PATH: {', '.join(missing)}")
 
     session = secrets.token_hex(16)
+    mode = "brainstorm" if args.brainstorm else "visible-review-loop"
     if not args.dry_run:
         ensure_hook(repo)
-        create_session(repo, session, args.max_rounds)
-    destination = write_config(repo, session)
+        create_session(repo, session, args.max_rounds, mode)
+    destination = write_config(repo, session, mode)
     uri = f"warp://tab_config/{CONFIG_STEM}"
     if not args.tab:
         uri += "?new_window=true"
@@ -230,7 +242,10 @@ def main() -> int:
         fail("could not open Warp; is Warp installed and registered for warp:// links?")
 
     print(f"opened Tincan for {repo} (session {session[:8]})")
-    print("Ready. Give Codex a normal task.")
+    if args.brainstorm:
+        print("Ready. Ask in Codex; Tincan will gather both independent views.")
+    else:
+        print("Ready. Give Codex a normal task.")
     return 0
 
 

@@ -52,6 +52,38 @@ tincan warp --repo ~/dev/your-project
 Use `--tab` for a tab in the current Warp window and `--max-rounds N` to change the
 review limit.
 
+## Independent brainstorms
+
+Launch the opt-in brainstorm mode when you want Codex and Claude to develop views
+as peers rather than use the implementation-and-review workflow:
+
+```sh
+cd ~/dev/your-project
+tincan brainstorm
+```
+
+Type each question once in the Codex pane. Tincan sends the same prompt to Claude
+before Codex begins its response. Neither model sees the other's initial answer.
+After both finish, Tincan exchanges those answers and asks each model to reconsider
+its position. When both reconsiderations finish, Codex presents a synthesis that
+retains any material disagreement. The panes then wait for the next question.
+
+```text
+                         one user prompt
+                        /               \
+          Codex independent view   Claude independent view
+                        \               /
+                     exchange after both finish
+                        /               \
+             Codex reconsideration   Claude reconsideration
+                        \               /
+                         Codex synthesis
+```
+
+Brainstorm sessions run Codex read-only and Claude in plan mode. They are intended
+for exploration and decisions, not implementation. Start an ordinary Tincan session
+when the discussion turns into work you want the agents to perform.
+
 ## Review contract
 
 Claude distinguishes concrete blocking problems from optional suggestions. Codex
@@ -111,6 +143,7 @@ location dirties the project worktree.
 ```text
 tincan                              open the paired Warp workspace for this repo
 tincan warp [--repo PATH]           explicitly open the paired workspace
+tincan brainstorm [--repo PATH]     independent views, reconsideration, synthesis
 tincan warp --tab                   open in the current Warp window
 tincan warp --max-rounds N          set the review limit (1-10)
 tincan send-claude MESSAGE          inject a prompt into the active Claude pane

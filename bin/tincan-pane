@@ -24,6 +24,10 @@ import tty
 
 CODEX_DEVELOPER_INSTRUCTIONS = """Before making implementation changes, inspect the current Git branch and worktree. Do not implement directly on the repository's default branch. If you are on the default branch and the current worktree can safely move with the task, create or switch to a concise, meaningful task branch before editing. Preserve all existing changes: never discard, overwrite, or silently absorb unrelated work. Follow applicable repository instructions (including AGENTS.md) and explicit user directions when they require a different branching workflow."""
 
+BRAINSTORM_DEVELOPER_INSTRUCTIONS = """You are one participant in an independent-first brainstorm with Claude. For an ordinary user prompt, develop only your own candid, concrete view; do not anticipate Claude's answer or claim consensus. Match depth to the question: for a simple question, use at most 3 concise bullets or roughly 150 words. Tincan will wait for both independent views, give each participant the other's view for delta-only reconsideration, and then ask you to synthesize. Follow those controller prompts precisely, avoid repeating earlier responses, and preserve meaningful disagreement. This mode is for thinking, not execution: do not edit files or take external actions."""
+
+CLAUDE_BRAINSTORM_INSTRUCTIONS = """You are one participant in an independent-first brainstorm with Codex. Develop a candid, concrete view from the user's prompt without anticipating Codex's answer. Match depth to the question: for a simple question, use at most 3 concise bullets or roughly 150 words. Later, reconsider it using Codex's independently formed view, reporting only material changes rather than repeating the discussion. Preserve meaningful disagreement. This mode is for thinking, not execution: do not edit files or take external actions."""
+
 
 def fail(message: str) -> "NoReturn":
     print(f"tincan: {message}", file=sys.stderr)
@@ -140,6 +144,7 @@ def run_agent(repo: Path, session: str | None, agent: str, argv: list[str]) -> i
         os.chdir(repo)
         if session:
             os.environ["TINCAN_SESSION"] = session
+        os.environ["TINCAN_AGENT"] = agent
         os.execvp(argv[0], argv)
 
     stdin_fd = sys.stdin.fileno()
@@ -256,15 +261,44 @@ def session_state(repo: Path, session: str) -> dict:
 
 
 def run_claude(repo: Path, session: str | None) -> int:
-    argv = ["claude", "--permission-mode", "auto"]
+    state = session_state(repo, session) if session else {}
+    if state.get("mode") == "brainstorm":
+        argv = [
+            "claude",
+            "--permission-mode",
+            "plan",
+            "--append-system-prompt",
+            CLAUDE_BRAINSTORM_INSTRUCTIONS,
+        ]
+    else:
+        argv = ["claude", "--permission-mode", "auto"]
     if session:
-        settings = session_state(repo, session).get("claude_settings")
+        settings = state.get("claude_settings")
         if isinstance(settings, str):
             argv.extend(["--settings", settings])
     return run_agent(repo, session, "claude", argv)
 
 
 def run_codex(repo: Path, session: str) -> int:
+    state = session_state(repo, session)
+    if state.get("mode") == "brainstorm":
+        developer_instructions = (
+            f"developer_instructions={json.dumps(BRAINSTORM_DEVELOPER_INSTRUCTIONS)}"
+        )
+        return run_agent(
+            repo,
+            session,
+            "codex",
+            [
+                "codex",
+                "--sandbox",
+                "read-only",
+                "--ask-for-approval",
+                "never",
+                "-c",
+                developer_instructions,
+            ],
+        )
     developer_instructions = (
         f"developer_instructions={json.dumps(CODEX_DEVELOPER_INSTRUCTIONS)}"
     )

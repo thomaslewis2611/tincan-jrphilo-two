@@ -50,6 +50,27 @@ class WarpLauncherTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("not inside a Git repository", result.stderr)
 
+    def test_brainstorm_dry_run_writes_brainstorm_workspace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo = base / "repo"
+            config_dir = base / "warp"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            environment = os.environ.copy()
+            environment["TINCAN_WARP_CONFIG_DIR"] = str(config_dir)
+
+            result = subprocess.run(
+                [str(WARP), "--repo", str(repo), "--brainstorm", "--dry-run"],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = (config_dir / "tincan_pair.toml").read_text()
+            self.assertIn('name = "Tincan Brainstorm"', config)
+            self.assertIn('title = "Tincan Brainstorm', config)
+
 
 if __name__ == "__main__":
     unittest.main()

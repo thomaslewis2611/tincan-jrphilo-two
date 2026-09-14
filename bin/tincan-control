@@ -70,8 +70,42 @@ def issue_context(root: Path, issue: str) -> tuple[str, str]:
     return label, context
 
 
-def hook_toml(hook: Path) -> str:
-    command = json.dumps(str(hook))
+def hook_toml(review_hook: Path, brainstorm_hook: Path | None = None) -> str:
+    review_command = json.dumps(str(review_hook))
+    brainstorm_hook = brainstorm_hook or review_hook.with_name("tincan-brainstorm-hook")
+    brainstorm_command = json.dumps(str(brainstorm_hook))
+    return f"""{MARKER}
+[features]
+hooks = true
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = {brainstorm_command}
+timeout = 20
+statusMessage = "Starting the parallel brainstorm"
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = {review_command}
+timeout = 900
+statusMessage = "Claude is reviewing the work"
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = {brainstorm_command}
+timeout = 30
+statusMessage = "Coordinating the brainstorm"
+"""
+
+
+def legacy_hook_toml(review_hook: Path) -> str:
+    command = json.dumps(str(review_hook))
     return f"""{MARKER}
 [features]
 hooks = true
@@ -89,20 +123,34 @@ statusMessage = "Claude is reviewing the work"
 def cmd_install(args: argparse.Namespace) -> int:
     root, git_dir, _ = repo_paths(args.repo)
     config_path = root / ".codex" / "config.toml"
-    hook = (Path(__file__).resolve().parent / "tincan-review-hook").resolve()
+    bin_dir = Path(__file__).resolve().parent
+    review_hook = (bin_dir / "tincan-review-hook").resolve()
+    brainstorm_hook = (bin_dir / "tincan-brainstorm-hook").resolve()
+    desired = hook_toml(review_hook, brainstorm_hook)
     if config_path.exists():
         current = config_path.read_text()
         if MARKER in current:
-            print(f"already installed: {config_path}")
-            return 0
+            if current == desired:
+                print(f"already installed: {config_path}")
+                return 0
+            if current == legacy_hook_toml(review_hook):
+                config_path.write_text(desired)
+                print(f"updated: {config_path}")
+                return 0
+            raise SystemExit(
+                f"{config_path} contains a modified Tincan configuration. "
+                "Tincan did not overwrite it.\n\n"
+                "Replace its Tincan hook configuration with:\n\n"
+                f"{desired}"
+            )
         raise SystemExit(
             f"{config_path} already exists. Tincan did not modify it.\n\n"
             "Add this hook manually:\n\n"
-            f"{hook_toml(hook)}"
+            f"{desired}"
         )
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(hook_toml(hook))
+    config_path.write_text(desired)
     exclude = git_dir / "info" / "exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
     existing = exclude.read_text() if exclude.exists() else ""

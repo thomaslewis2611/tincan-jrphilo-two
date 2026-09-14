@@ -10,6 +10,7 @@ tincan [command]
 
   (no command)         open real Codex + Claude panes for the current repo
   warp [--repo P]      open real Codex + Claude panes in Warp
+  brainstorm [--repo P] open an independent-first brainstorm in Warp
   send-claude MESSAGE  submit a prompt to the visible Claude pane
   send-codex MESSAGE   submit a prompt to the visible Codex pane
 
@@ -43,6 +44,10 @@ cmd="${1:-}"; shift 2>/dev/null || true
 case "$cmd" in
   warp)
     exec "$HERE/tincan-warp" "$@"
+    ;;
+
+  brainstorm)
+    exec "$HERE/tincan-warp" --brainstorm "$@"
     ;;
 
   claude-pane)

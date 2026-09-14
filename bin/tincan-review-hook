@@ -202,6 +202,7 @@ def handle_visible_handoff(
     if (
         session.get("session_token") != token
         or session.get("repo") != str(root)
+        or session.get("mode", "visible-review-loop") != "visible-review-loop"
     ):
         return {}
 
