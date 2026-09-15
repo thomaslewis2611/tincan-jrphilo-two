@@ -58,7 +58,9 @@ class BrainstormHookTests(unittest.TestCase):
         )
 
     def test_user_prompt_starts_both_independent_views(self):
-        with mock.patch.object(MODULE, "send_to_pane", return_value=None) as send:
+        with mock.patch.object(
+            MODULE, "send_controller_prompt", return_value=None
+        ) as send:
             output = MODULE.handle_user_prompt(
                 self.root, self.session_path, self.token, "Which domain should I buy?"
             )
@@ -72,9 +74,12 @@ class BrainstormHookTests(unittest.TestCase):
             "roughly 150 words",
             output["hookSpecificOutput"]["additionalContext"],
         )
-        self.assertEqual(send.call_args.args[:3], (self.root, self.token, "claude"))
-        self.assertIn("same prompt", send.call_args.args[3])
-        self.assertIn("roughly 150 words", send.call_args.args[3])
+        self.assertEqual(
+            send.call_args.args[:4],
+            (self.root, self.session_path, self.token, "claude"),
+        )
+        self.assertIn("same prompt", send.call_args.args[4])
+        self.assertIn("roughly 150 words", send.call_args.args[4])
 
     def test_second_initial_view_cross_shares_without_anchoring_first(self):
         self.write_session(
@@ -89,15 +94,17 @@ class BrainstormHookTests(unittest.TestCase):
         first = self.stop("codex", "Codex initially prefers A.")
         self.assertNotIn("decision", first)
 
-        with mock.patch.object(MODULE, "send_to_pane", return_value=None) as send:
+        with mock.patch.object(
+            MODULE, "send_controller_prompt", return_value=None
+        ) as send:
             second = self.stop("claude", "Claude independently prefers B.")
 
         state = self.session()
         self.assertEqual(state["status"], "reflection")
         self.assertEqual(state["initial"]["codex"], "Codex initially prefers A.")
         self.assertEqual(state["initial"]["claude"], "Claude independently prefers B.")
-        self.assertEqual(send.call_args.args[2], "codex")
-        self.assertIn("Claude independently prefers B.", send.call_args.args[3])
+        self.assertEqual(send.call_args.args[3], "codex")
+        self.assertIn("Claude independently prefers B.", send.call_args.args[4])
         self.assertEqual(second["decision"], "block")
         self.assertIn("Codex initially prefers A.", second["reason"])
         self.assertIn("Report only the delta", second["reason"])
@@ -116,12 +123,14 @@ class BrainstormHookTests(unittest.TestCase):
         first = self.stop("codex", "Codex now prefers A plus one part of B.")
         self.assertNotIn("decision", first)
 
-        with mock.patch.object(MODULE, "send_to_pane", return_value=None) as send:
+        with mock.patch.object(
+            MODULE, "send_controller_prompt", return_value=None
+        ) as send:
             second = self.stop("claude", "Claude still prefers B, for this reason.")
 
         self.assertEqual(self.session()["status"], "synthesis")
-        self.assertEqual(send.call_args.args[2], "codex")
-        synthesis_prompt = send.call_args.args[3]
+        self.assertEqual(send.call_args.args[3], "codex")
+        synthesis_prompt = send.call_args.args[4]
         self.assertIn("Codex now prefers A", synthesis_prompt)
         self.assertIn("Claude still prefers B", synthesis_prompt)
         self.assertIn("unresolved disagreement", synthesis_prompt)
@@ -141,7 +150,7 @@ class BrainstormHookTests(unittest.TestCase):
         state["status"] = "reflection"
         self.write_session(state)
 
-        with mock.patch.object(MODULE, "send_to_pane") as send:
+        with mock.patch.object(MODULE, "send_controller_prompt") as send:
             output = MODULE.handle_user_prompt(
                 self.root, self.session_path, self.token, "A second question"
             )
@@ -149,6 +158,49 @@ class BrainstormHookTests(unittest.TestCase):
         self.assertEqual(output["decision"], "block")
         self.assertIn("still completing", output["reason"])
         send.assert_not_called()
+
+    def test_controller_prompt_accepts_legacy_trailing_newline_hash(self):
+        prompt = "Synthesize these views"
+        state = self.session()
+        state.update(
+            status="synthesis",
+            pending_codex_prompt_hash=MODULE.hashlib.sha256(
+                (prompt + "\n").encode()
+            ).hexdigest(),
+        )
+        self.write_session(state)
+
+        output = MODULE.handle_controller_prompt(
+            self.session_path, "codex", prompt
+        )
+
+        self.assertEqual(output, {})
+        self.assertNotIn("pending_codex_prompt_hash", self.session())
+
+    def test_codex_delivery_waits_for_prompt_acceptance(self):
+        prompt = "Controller synthesis prompt"
+        state = self.session()
+        state.update(
+            status="synthesis",
+            pending_codex_prompt_hash=MODULE.prompt_hash(prompt),
+        )
+        self.write_session(state)
+
+        def accept_prompt(*_args):
+            MODULE.handle_controller_prompt(self.session_path, "codex", prompt)
+            return None
+
+        with mock.patch.object(MODULE, "send_to_pane", side_effect=accept_prompt) as send:
+            error = MODULE.send_controller_prompt(
+                self.root,
+                self.session_path,
+                self.token,
+                "codex",
+                prompt,
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(send.call_count, 1)
 
 
 if __name__ == "__main__":

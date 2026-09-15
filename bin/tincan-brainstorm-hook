@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 from typing import Any, Iterator
 
 
@@ -70,7 +71,23 @@ def git_paths(cwd: Path) -> tuple[Path, Path] | None:
 
 
 def prompt_hash(prompt: str) -> str:
-    return hashlib.sha256(prompt.encode()).hexdigest()
+    normalized = prompt.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def prompt_matches_hash(prompt: str, expected: str) -> bool:
+    """Accept canonical hashes and hashes written by the first brainstorm release."""
+    candidates = {
+        prompt_hash(prompt),
+        hashlib.sha256(prompt.encode()).hexdigest(),
+        hashlib.sha256((prompt + "\n").encode()).hexdigest(),
+        hashlib.sha256((prompt + "\n\n").encode()).hexdigest(),
+    }
+    return expected in candidates
+
+
+def pending_key(agent: str) -> str:
+    return f"pending_{agent}_prompt_hash"
 
 
 def send_to_pane(root: Path, token: str, agent: str, prompt: str) -> str | None:
@@ -97,6 +114,35 @@ def send_to_pane(root: Path, token: str, agent: str, prompt: str) -> str | None:
     if result.returncode:
         return (result.stderr or result.stdout).strip() or f"{agent} pane rejected prompt"
     return None
+
+
+def send_controller_prompt(
+    root: Path,
+    session_path: Path,
+    token: str,
+    agent: str,
+    prompt: str,
+    attempts: int = 3,
+) -> str | None:
+    """Send until the target's UserPromptSubmit hook acknowledges the prompt."""
+    if agent != "codex":
+        # Claude's session-specific settings may predate prompt acknowledgements.
+        # Its Stop hooks still provide completion acknowledgement for the round.
+        return send_to_pane(root, token, agent, prompt)
+    expected = prompt_hash(prompt)
+    key = pending_key(agent)
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(0.5)
+        error = send_to_pane(root, token, agent, prompt)
+        if error:
+            return error
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if load_json(session_path).get(key) != expected:
+                return None
+            time.sleep(0.1)
+    return f"{agent.title()} pane received the prompt but did not accept it"
 
 
 def independent_prompt(user_prompt: str, cycle: int) -> str:
@@ -173,6 +219,7 @@ def fail_cycle(session_path: Path, detail: str) -> dict[str, Any]:
     with locked_session(session_path) as session:
         session.update(status="awaiting-user", error=detail, failed_at=utc_now())
         session.pop("pending_codex_prompt_hash", None)
+        session.pop("pending_claude_prompt_hash", None)
     return {
         "decision": "block",
         "reason": f"Tincan could not continue this brainstorm cycle: {detail}",
@@ -210,8 +257,11 @@ def handle_user_prompt(
         )
         session.pop("synthesis", None)
         session.pop("error", None)
+        prompt_for_claude = independent_prompt(prompt, cycle)
 
-    error = send_to_pane(root, token, "claude", independent_prompt(prompt, cycle))
+    error = send_controller_prompt(
+        root, session_path, token, "claude", prompt_for_claude
+    )
     if error:
         return fail_cycle(session_path, error)
     return {
@@ -253,12 +303,15 @@ def record_initial(
         codex_prompt = reflection_prompt("Claude", initial["claude"], cycle)
         claude_prompt = reflection_prompt("Codex", initial["codex"], cycle)
         session["status"] = "reflection"
-        if agent == "claude":
-            session["pending_codex_prompt_hash"] = prompt_hash(codex_prompt)
 
     other_agent = "claude" if agent == "codex" else "codex"
     other_prompt = claude_prompt if other_agent == "claude" else codex_prompt
-    error = send_to_pane(root, token, other_agent, other_prompt)
+    if other_agent == "codex":
+        with locked_session(session_path) as session:
+            session[pending_key(other_agent)] = prompt_hash(other_prompt)
+    error = send_controller_prompt(
+        root, session_path, token, other_agent, other_prompt
+    )
     if error:
         return fail_cycle(session_path, error)
     own_prompt = codex_prompt if agent == "codex" else claude_prompt
@@ -290,7 +343,7 @@ def record_reflection(
         prompt = synthesis_prompt(session)
         session["status"] = "synthesis"
         if agent == "claude":
-            session["pending_codex_prompt_hash"] = prompt_hash(prompt)
+            session[pending_key("codex")] = prompt_hash(prompt)
 
     if agent == "codex":
         return {
@@ -299,7 +352,7 @@ def record_reflection(
             "systemMessage": "Both reconsiderations are complete; Codex is synthesizing.",
         }
 
-    error = send_to_pane(root, token, "codex", prompt)
+    error = send_controller_prompt(root, session_path, token, "codex", prompt)
     if error:
         return fail_cycle(session_path, error)
     return {"systemMessage": "Both reconsiderations are complete; Codex is synthesizing."}
@@ -340,6 +393,29 @@ def handle_stop(
     return {}
 
 
+def handle_controller_prompt(
+    session_path: Path, agent: str, prompt: str
+) -> dict[str, Any] | None:
+    """Consume a controller delivery, or return None for an ordinary user prompt."""
+    with locked_session(session_path) as session:
+        if session.get("mode") != "brainstorm" or not session.get("enabled"):
+            return None
+        key = pending_key(agent)
+        expected = session.get(key)
+        if not expected:
+            return None
+        if prompt_matches_hash(prompt, expected):
+            session.pop(key, None)
+            return {}
+        return {
+            "decision": "block",
+            "reason": (
+                "Tincan has a controller handoff pending for this pane. Wait for that "
+                "handoff before submitting another prompt."
+            ),
+        }
+
+
 def main() -> int:
     try:
         event = json.load(sys.stdin)
@@ -364,9 +440,22 @@ def main() -> int:
         return 0
 
     event_name = event.get("hook_event_name") or event.get("hook_event")
-    if event_name == "UserPromptSubmit" and agent == "codex":
+    if event_name == "UserPromptSubmit":
         prompt = event.get("prompt")
-        output = handle_user_prompt(root, session_path, token, prompt) if prompt else {}
+        controller_output = (
+            handle_controller_prompt(session_path, agent, prompt) if prompt else None
+        )
+        if controller_output is not None:
+            output = controller_output
+        elif agent == "codex" and prompt:
+            output = handle_user_prompt(root, session_path, token, prompt)
+        elif agent == "claude":
+            output = {
+                "decision": "block",
+                "reason": "Submit brainstorm questions in the Codex pane so both models receive them.",
+            }
+        else:
+            output = {}
     elif event_name == "Stop":
         output = handle_stop(root, session_path, token, agent, event)
     else:
