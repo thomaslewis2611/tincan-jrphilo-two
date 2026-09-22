@@ -9,18 +9,66 @@ Claude then reviews again. Approval ends the current review cycle; after Codex
 reports the approved result, the same panes wait for another task. Five unresolved
 rounds escalate to the human by default.
 
-## Quick start
+## Access and installation
 
-Prerequisites: macOS, Warp, Git, and authenticated `codex` and `claude` CLIs.
+Tincan currently runs from its source repository; it is not yet distributed as a
+Homebrew package or standalone application. Because the repository is private, a
+new user first needs to be invited as a GitHub collaborator and accept the
+invitation. Packaging would make installation easier, but a private package would
+still require some form of access control.
 
-Put the launcher on your path once:
+### 1. Install the prerequisites
+
+Tincan currently requires:
+
+- macOS
+- Warp
+- Git
+- the `codex` CLI, installed and authenticated with the user's own account
+- the `claude` CLI, installed and authenticated with the user's own account
+
+Both commands must be available on `PATH`. Tincan does not provide or share access
+to either service.
+
+### 2. Get access and clone Tincan
+
+Send the repository owner your GitHub username. After the owner adds you as a
+collaborator, accept GitHub's invitation, then run:
+
+```sh
+mkdir -p ~/dev
+cd ~/dev
+git clone https://github.com/jrphilo/tincan.git
+cd tincan
+```
+
+### 3. Put the launcher on your path
+
+Create a symlink once:
 
 ```sh
 mkdir -p ~/.local/bin
 ln -s "$PWD/bin/tincan" ~/.local/bin/tincan
 ```
 
-Then run it from any Git repository:
+If `~/.local/bin` is not already on `PATH`, add this line to `~/.zshrc`, then open
+a new terminal:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Verify the installation:
+
+```sh
+tincan doctor
+```
+
+Resolve any reported failures before continuing.
+
+### 4. Start a session
+
+Run Tincan from any Git repository you want Codex and Claude to work on:
 
 ```sh
 cd ~/dev/your-project
@@ -43,6 +91,15 @@ No separate arming command or issue number is required. The first launch in a
 repository installs a local Codex Stop hook. Codex may ask you to trust that hook
 once.
 
+To update Tincan later:
+
+```sh
+cd ~/dev/tincan
+git pull
+```
+
+The symlink continues to use the updated checkout.
+
 To launch without changing directory first:
 
 ```sh
@@ -51,6 +108,25 @@ tincan warp --repo ~/dev/your-project
 
 Use `--tab` for a tab in the current Warp window and `--max-rounds N` to change the
 review limit.
+
+## Distribution options
+
+The private collaborator flow above is the simplest way to share Tincan with a
+small number of people. It provides normal `git pull` updates and does not require
+maintaining a separate package.
+
+Other options are:
+
+- Send a source archive directly. This avoids a GitHub invitation, but updates are
+  manual and recipients cannot pull fixes.
+- Publish a private Homebrew tap or package. This improves installation, but users
+  still need credentials for the private source or artifact host.
+- Make the repository public and add an open-source license. This removes the
+  invitation step and makes a public Homebrew formula straightforward.
+
+In other words, repository access and packaging solve different problems: access
+controls who may obtain Tincan; packaging controls how conveniently they install
+it.
 
 ## Independent brainstorms
 
