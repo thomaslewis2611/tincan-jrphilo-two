@@ -299,6 +299,17 @@ def run_codex(repo: Path, session: str) -> int:
                 developer_instructions,
             ],
         )
+    if state.get("poolside_mode"):
+        instructions = (
+            "You are Tincan's read-only peer reviewer. Poolside implements all changes. "
+            "Wait for Tincan's review prompts, inspect the checkout and verify findings, "
+            "but do not edit or launch other agents. End every review with exactly one "
+            "TINCAN_VERDICT: APPROVED or TINCAN_VERDICT: CHANGES_REQUESTED line."
+        )
+        return run_agent(repo, session, "codex", [
+            "codex", "--sandbox", "read-only", "--ask-for-approval", "never",
+            "-c", f"developer_instructions={json.dumps(instructions)}",
+        ])
     developer_instructions = (
         f"developer_instructions={json.dumps(CODEX_DEVELOPER_INSTRUCTIONS)}"
     )
@@ -319,12 +330,14 @@ def run_poolside(repo: Path, session: str | None) -> int:
     """
     executable = os.environ.get("TINCAN_POOL", "pool")
     argv = [executable]
-    settings = None
     if session:
         state = session_state(repo, session)
-        if state.get("mode") == "brainstorm":
-            argv = [executable, "--sandbox", "disabled"]
         settings = state.get("poolside_settings")
+        if not settings:
+            fail("this Poolside session predates automatic hooks; relaunch tincan warp --poolside")
+        # Arguments after -- go to the built-in pool acp server, which owns
+        # --settings. Keep the user's normal Poolside login and sandbox settings.
+        argv.extend(["--", "--settings", settings])
     return run_agent(repo, session, "poolside", argv)
 
 

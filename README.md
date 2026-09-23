@@ -260,7 +260,7 @@ are retained for experiments documented in [docs/CONSTRAINTS.md](docs/CONSTRAINT
 ## Poolside mode
 
 Poolside can serve as the implementation lead, with Codex and Claude performing
-peer and secondary review respectively. Three workflows are supported:
+peer and secondary review respectively. Two workflows are supported:
 
 ### Headless: `tincan pool-exec`
 
@@ -306,24 +306,39 @@ Layout:
 └───────────────────────────────┘
 ```
 
-Poolside writes code; Codex peer-reviews; Claude provides a secondary read-only
-review. When Claude approves, the verdict is sent back to the Poolside pane.
-Poolside can then address findings and hand off again, or start a new task.
+Give Poolside a normal task. Native Poolside lifecycle hooks automatically run
+**Poolside → Codex → Claude → Poolside**. Both reviewers inspect the same checkout
+read-only, and both must approve. Tincan returns both reviews to Poolside; it fixes
+valid blockers or rebuts them with evidence, then both reviewers audit again.
+Five unresolved rounds stop for human adjudication by default (`--max-rounds N`).
 
-### Visible: `tincan start --poolside` + manual handoff
+After approval, Poolside summarizes and the panes wait for the next task. Optional
+suggestions receive one triage pass; any resulting edits are reviewed again.
+Commits and other administrative actions do not retrigger review when approved
+file contents are unchanged. Missing or conflicting verdicts, failed handoffs,
+and content changes during review stop the loop without approval.
 
-Arms the headless gate so that Codex's Stop hook triggers the review chain:
+This requires Poolside CLI **1.0.16 or newer**, using its built-in Poolside ACP
+server. Tincan passes private per-session hook settings through `pool -- --settings`;
+it preserves your project and personal settings. No manual send command is needed.
+Restart sessions opened before this update to load the new hooks.
+Claude API errors also stop the loop and return the failure to Poolside, without
+marking the code approved. A saved login alone does not prove service access: if
+Claude reports an organization restriction, try `/login` in Claude with the intended
+subscription account and organization. If it persists, contact your organization
+administrator or Anthropic support. Tincan cannot override account access policies.
 
-```sh
-cd ~/dev/your-project
-tincan start --poolside          # arm the gate
-# ... give Codex a task ...
-# Codex's Stop hook sends the completed work to Claude for review
-# (review hook routes Claude's verdict to the Poolside pane instead of Codex)
-```
 
-When in Poolside mode, the review hook re-arms to `awaiting-user` after approval,
-so the Poolside pane is ready for the next task immediately.
+Claude runs as the normal interactive `claude` CLI in its own Warp pane, using its
+existing login. A Claude Pro/Max subscription works with Claude Code; no API key is
+required. Check `claude auth status` from a normal terminal and use `claude auth login`
+if needed. Running Claude from inside another agent's sandbox can hide the macOS
+Keychain login; Tincan's visible mode avoids that by sending to the already running
+Claude pane. An `ANTHROPIC_API_KEY` can override subscription authentication; see
+[Claude's authentication guidance](https://support.claude.com/en/articles/12304248-manage-api-key-environment-variables-in-claude-code).
+
+`start --poolside` is a headless state command; it does not connect interactive panes.
+Use `warp --poolside` for the visible automatic loop or `pool-exec` for headless work.
 
 ### Optional reviewer exclusion
 
@@ -342,13 +357,11 @@ tincan warp --repo ~/dev/project --poolside --no-codex    # Poolside + Claude
 | Flag | Headless | Visible layout | Review chain |
 |---|---|---|---|
 | *(default)* | `pool-exec` | 3 panes | Poolside → Codex → Claude → Poolside |
-| `--skip-codex` / `--no-claude` | `pool-exec --skip-codex` | 2 panes | Poolside → Claude → Poolside |
-| `--skip-claude` / `--no-codex` | `pool-exec --skip-claude` | 2 panes | Poolside → Codex → Poolside |
+| `--skip-codex` / `--no-codex` | `pool-exec --skip-codex` | 2 panes | Poolside → Claude → Poolside |
+| `--skip-claude` / `--no-claude` | `pool-exec --skip-claude` | 2 panes | Poolside → Codex → Poolside |
 
-In `--no-claude` visible mode the review hook runs Claude headlessly (within the
-hook) and routes the verdict to the Poolside pane — no Claude pane is shown.
-In `--no-codex` visible mode the user sends from Poolside to Claude manually,
-and Claude's verdict returns to Poolside via the `tincan-pool-claude-hook`.
+The excluded reviewer is neither launched nor called headlessly. The remaining
+reviewer must approve; all other loop behavior is the same.
 
 ### Key differences from Codex-led mode
 
@@ -357,12 +370,12 @@ and Claude's verdict returns to Poolside via the `tincan-pool-claude-hook`.
 | Layout | 2 panes (Codex, Claude) | 3 panes (Poolside, Codex, Claude) |
 | Implementation agent | Codex | Poolside |
 | Review chain | Codex → Claude → Codex | Poolside → Codex → Claude → Poolside |
-| Post-approval | Codex summarizes | Poolside receives verdict |
+| Post-approval | Codex summarizes | Poolside summarizes; panes rearm |
 | Hook routing | Claude verdict → Codex pane | Claude verdict → Poolside pane |
 
 ## Current scope
 
-Tincan currently targets Warp on macOS and uses Warp Tab Configs for the two-pane
-layout. A future council mode may generalize the same session transport to several
+Tincan currently targets Warp on macOS and uses Warp Tab Configs for two- or
+three-pane layouts. A future council mode may generalize the same session transport to several
 read-only perspectives feeding one lead agent, but that is intentionally outside
 the current implementation.

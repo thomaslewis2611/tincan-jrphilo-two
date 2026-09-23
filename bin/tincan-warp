@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import shutil
@@ -63,11 +64,6 @@ def ensure_hook(repo: Path) -> None:
         fail("could not install the Codex handoff hook; see the message above")
 
 
-def _poolside_claude_settings_path(sessions: Path, token: str) -> Path:
-    """Path for Claude settings that routes reviews to poolside (not codex)."""
-    return sessions / f"{token}-poolside-claude-settings.json"
-
-
 def create_session(repo: Path, token: str, max_rounds: int, mode: str,
                    poolside: bool = False,
                    no_codex: bool = False, no_claude: bool = False) -> Path:
@@ -80,52 +76,31 @@ def create_session(repo: Path, token: str, max_rounds: int, mode: str,
         hook_name = (
             "tincan-brainstorm-hook" if mode == "brainstorm" else "tincan-claude-hook"
         )
-        review_hook_name = "tincan-review-hook"
     claude_hook = Path(__file__).resolve().with_name(hook_name)
     settings_path = sessions / f"{token}-claude-settings.json"
 
-    if not poolside:
-        settings = {
-            "hooks": {
-                "Stop": [
-                    {
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": str(claude_hook),
-                                "timeout": 30,
-                                "statusMessage": (
-                                    "Coordinating the brainstorm"
-                                    if mode == "brainstorm"
-                                    else "Sending Claude's review to Codex"
-                                ),
-                            }
-                        ]
-                    }
-                ]
-            }
+    settings = {
+        "hooks": {
+            "Stop": [{"hooks": [{
+                "type": "command",
+                "command": shlex.quote(str(claude_hook)),
+                "timeout": 30,
+                "statusMessage": (
+                    "Sending Claude's review to Poolside" if poolside
+                    else "Coordinating the brainstorm" if mode == "brainstorm"
+                    else "Sending Claude's review to Codex"
+                ),
+            }]}]
         }
-        settings_path.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n")
-    else:
-        # In poolside mode, Claude's Stop hook sends the verdict to the
-        # Poolside pane instead of back to the Codex pane.
-        settings = {
-            "hooks": {
-                "Stop": [
-                    {
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": str(claude_hook),
-                                "timeout": 30,
-                                "statusMessage": "Sending Claude's review to Poolside",
-                            }
-                        ]
-                    }
-                ]
-            }
-        }
-        settings_path.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n")
+    }
+    if poolside:
+        # API failures do not fire Stop, so otherwise the chain waits forever.
+        settings["hooks"]["StopFailure"] = [{"hooks": [{
+            "type": "command",
+            "command": shlex.quote(str(claude_hook)),
+            "timeout": 30,
+        }]}]
+    settings_path.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n")
 
     value = {
         "enabled": True,
@@ -144,6 +119,17 @@ def create_session(repo: Path, token: str, max_rounds: int, mode: str,
         "claude_settings": str(settings_path),
     }
     if poolside:
+        pool_hook = Path(__file__).resolve().with_name("tincan-pool-hook")
+        pool_settings = sessions / f"{token}-poolside-settings.yaml"
+        # JSON is valid YAML; use no additional YAML dependency.
+        pool_hooks = {
+            event: [{"name": "tincan-poolside", "matcher": "*",
+                     "command": shlex.quote(str(pool_hook)), "timeout": 30}]
+            for event in ("SessionStart", "UserPromptSubmit", "Stop")
+        }
+        pool_hooks["stop_hook_max_continuations"] = 1
+        pool_settings.write_text(json.dumps({"hooks": pool_hooks}, indent=2) + "\n")
+        value["poolside_settings"] = str(pool_settings)
         value["status"] = "awaiting-user"
         value["review_chain"] = (
             ["poolside", "claude", "poolside"] if no_codex
@@ -371,19 +357,36 @@ def main() -> int:
     args = parse_args()
     repo = repo_root(args.repo)
 
-    missing = [command for command in ("codex", "claude") if not shutil.which(command)]
+    if args.poolside and args.brainstorm:
+        fail("--poolside cannot be combined with --brainstorm")
+    if (args.no_codex or args.no_claude) and not args.poolside:
+        fail("--no-codex and --no-claude require --poolside")
+    if args.no_codex and args.no_claude:
+        fail("--no-codex and --no-claude are mutually exclusive; at least one reviewer is required")
+    required = []
+    if not args.no_codex:
+        required.append("codex")
+    if not args.no_claude:
+        required.append("claude")
+    if args.poolside:
+        required.append(os.environ.get("TINCAN_POOL", "pool"))
+    missing = [command for command in required if not shutil.which(command)]
     if missing and not args.dry_run:
         fail(f"missing from PATH: {', '.join(missing)}")
-    if args.poolside and not shutil.which("pool") and not args.dry_run:
-        fail("pool is not on PATH; install the Poolside CLI to use --poolside mode")
-    if args.poolside and args.no_codex and args.no_claude:
-        fail("--no-codex and --no-claude are mutually exclusive; at least one reviewer is required")
+
+    if args.poolside and not args.dry_run:
+        executable = os.environ.get("TINCAN_POOL", "pool")
+        result = subprocess.run([executable, "--version"], text=True, capture_output=True)
+        version = re.search(r"(\d+)\.(\d+)\.(\d+)", result.stdout)
+        if result.returncode or not version or tuple(map(int, version.groups())) < (1, 0, 16):
+            fail("automatic Poolside handoffs require pool 1.0.16 or newer; run pool update")
 
     session = secrets.token_hex(16)
     mode = "brainstorm" if args.brainstorm else "visible-review-loop"
     config_stem = POOLSIDE_CONFIG_STEM if args.poolside else CONFIG_STEM
     if not args.dry_run:
-        ensure_hook(repo)
+        if not args.no_codex:
+            ensure_hook(repo)
         create_session(
             repo, session, args.max_rounds, mode,
             poolside=args.poolside,
@@ -415,12 +418,7 @@ def main() -> int:
     if args.brainstorm:
         print("Ready. Ask in Codex; Tincan will gather both independent views.")
     elif args.poolside:
-        if args.no_claude:
-            print("Ready. Give Poolside a task; send reviews with 'tincan send-codex'.")
-        elif args.no_codex:
-            print("Ready. Give Poolside a task; send reviews with 'tincan send-claude'.")
-        else:
-            print("Ready. Give Poolside a task; send reviews with 'tincan send-codex'.")
+        print("Ready. Give Poolside a normal task; reviews and fixes are handed off automatically.")
     else:
         print("Ready. Give Codex a normal task.")
     return 0
