@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""Headless pipeline: Poolside implements, Codex peer-reviews, Claude re-reviews.
+
+Usage:
+  tincan pool-exec [--repo PATH] [--max-rounds N] [-p "prompt" | -f file]
+  tincan pool-exec --continue [--repo PATH]
+
+Flow:
+  1. Run ``pool exec`` to implement the task.
+  2. Run ``codex exec review --uncommitted`` to peer-review the changes.
+  3. If Codex approves, run ``claude -p`` with a JSON schema for secondary review.
+  4. If either reviewer finds blocking issues, re-run ``pool exec --continue``
+     with the findings as a new prompt, looping up to --max-rounds.
+
+Optional reviewer gating:
+  --skip-codex   skip the Codex peer-review step (Poolside → Claude only)
+  --skip-claude  skip the Claude secondary-review step (Poolside → Codex only)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MARKER = "# tincan-review-gate"
+
+REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["approved", "changes_requested"]},
+        "summary": {"type": "string"},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string", "enum": ["blocking", "suggestion"]},
+                    "title": {"type": "string"},
+                    "details": {"type": "string"},
+                    "file": {"type": ["string", "null"]},
+                    "line": {"type": ["integer", "null"]},
+                },
+                "required": ["severity", "title", "details", "file", "line"],
+                "additionalProperties": False,
+            },
+        },
+        "verification": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["verdict", "summary", "findings", "verification"],
+    "additionalProperties": False,
+}
+
+# Tools Claude is allowed to use during a read-only review.
+CLADE_ALLOWED_TOOLS = (
+    "Read,Glob,Grep,Bash(git diff *),Bash(git status *),Bash(git log *),"
+    "Bash(git show *),Bash(git rev-parse *),Bash(git ls-files *),"
+    "Bash(npm test *),Bash(npm run test *),Bash(npm run typecheck *),"
+    "Bash(npm run lint *),Bash(npm run check *),Bash(node --test *),"
+    "Bash(pytest *),Bash(cargo test *),Bash(go test *),Bash(swift test *)"
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers (shared patterns with tincan-review-hook)
+# ---------------------------------------------------------------------------
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def git_paths(cwd: Path) -> tuple[Path, Path]:
+    """Return (repo_root, git_dir) for the given working directory."""
+    root_result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=cwd, text=True, capture_output=True,
+    )
+    if root_result.returncode:
+        raise SystemExit(f"not inside a Git repository: {cwd}")
+    root = Path(root_result.stdout.strip())
+    dir_result = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-dir"],
+        cwd=root, text=True, capture_output=True,
+    )
+    if dir_result.returncode:
+        raise SystemExit(f"could not locate Git metadata for {root}")
+    return root, Path(dir_result.stdout.strip())
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    temp.replace(path)
+
+
+def current_head(root: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True, capture_output=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def has_changes(root: Path, base_commit: str | None) -> bool:
+    """True if the working tree differs from ``base_commit``."""
+    if not base_commit:
+        return True
+    diff = subprocess.run(
+        ["git", "diff", "--quiet", base_commit, "--"],
+        cwd=root, text=True, capture_output=True,
+    )
+    if diff.returncode == 1:
+        return True
+    if diff.returncode not in (0, 1):
+        return True
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=normal"],
+        cwd=root, text=True, capture_output=True,
+    )
+    return bool(status.stdout.strip())
+
+
+def load_state(state_dir: Path) -> dict[str, Any]:
+    return load_json(state_dir / "state.json")
+
+
+def save_state(state_dir: Path, state: dict[str, Any]) -> None:
+    save_json(state_dir / "state.json", state)
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — Poolside
+# ---------------------------------------------------------------------------
+
+def run_pool_exec(
+    root: Path, prompt: str, continue_run: bool = False
+) -> tuple[int, str, str | None]:
+    """Run ``pool exec`` and return ``(exit_code, stdout, run_id)``."""
+    executable = os.environ.get("TINCAN_POOL", "pool")
+    args = [
+        executable, "exec",
+        "--unsafe-auto-allow",
+        "--sandbox", "disabled",
+        "-o", "json",
+        "--directory", str(root),
+    ]
+    if continue_run:
+        args.append("--continue")
+    # Read prompt from stdin to avoid shell length limits and quoting issues.
+    args.extend(["-p", "-"])
+
+    result = subprocess.run(
+        args,
+        input=prompt,
+        cwd=root,
+        text=True,
+        capture_output=True,
+    )
+
+    # The run ID appears in pool session metadata. We also track it via
+    # the latest entry in the sessions directory as a fallback.
+    run_id: str | None = None
+    for line in result.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        # pool exec JSONL events may carry session/run metadata
+        for key in ("runId", "run_id", "sessionId", "session_id"):
+            value = event.get(key)
+            if isinstance(value, str):
+                run_id = value
+                break
+        if run_id:
+            break
+
+    return result.returncode, result.stdout, run_id
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — Codex peer review
+# ---------------------------------------------------------------------------
+
+# Codex review output uses a line format like:
+#   - [P2] <title> — /path/to/file:line
+#     <details>
+# where P1 = critical, P2 = major, P3 = minor.
+# P1/P2 → blocking, P3 → suggestion.
+# ---------------------------------------------------------------------------
+_codex_finding_re = re.compile(
+    r"-\s+\[(P[123])\]\s+(.+?)\s+—\s+(.+?):(\d+)\s*\n\s+(.+?)(?=\n- \[|\Z)",
+    re.DOTALL,
+)
+
+
+def parse_codex_review(review_text: str) -> list[dict[str, Any]]:
+    """Parse ``codex exec review`` text output into tincan finding dicts."""
+    findings: list[dict[str, Any]] = []
+    for match in _codex_finding_re.finditer(review_text):
+        severity = "blocking" if match.group(1) in ("P1", "P2") else "suggestion"
+        findings.append(
+            {
+                "severity": severity,
+                "title": match.group(2).strip(),
+                "details": match.group(5).strip(),
+                "file": match.group(3).strip(),
+                "line": int(match.group(4)),
+            }
+        )
+    return findings
+
+
+def run_codex_review(root: Path) -> tuple[int, str, list[dict[str, Any]]]:
+    """Run ``codex exec review --uncommitted`` and parse the result."""
+    args = [
+        "codex", "exec", "review",
+        "--uncommitted",
+        "--json",
+        "--skip-git-repo-check",
+    ]
+    result = subprocess.run(args, cwd=root, text=True, capture_output=True)
+
+    review_text = ""
+    for line in result.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = event.get("item")
+        if (
+            event.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "agent_message"
+        ):
+            review_text = item.get("text", "")
+
+    findings = parse_codex_review(review_text)
+    return result.returncode, review_text, findings
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — Claude secondary review
+# ---------------------------------------------------------------------------
+
+def claude_review_prompt(
+    root: Path,
+    base_commit: str | None,
+    codex_review: str,
+    round_number: int,
+    prior_claude_session: str | None,
+) -> str:
+    """Build the prompt sent to Claude for the secondary review."""
+    diff_snapshot = ""
+    status = subprocess.run(
+        ["git", "status", "--short", "--untracked-files=normal"],
+        cwd=root, text=True, capture_output=True,
+    )
+    diff_args = ["git", "diff", "--no-ext-diff", "--unified=40"]
+    if base_commit:
+        diff_args.append(base_commit)
+    diff_args.append("--")
+    diff = subprocess.run(diff_args, cwd=root, text=True, capture_output=True)
+
+    diff_snapshot = (
+        "git status --short:\n"
+        + (status.stdout or status.stderr or "(clean)")
+        + "\nTracked diff from the original base:\n"
+        + (diff.stdout or diff.stderr or "(none)")
+    )
+    if len(diff_snapshot) > 80_000:
+        diff_snapshot = diff_snapshot[:80_000] + "\n[truncated]\n"
+
+    return f"""You are the independent, read-only secondary reviewer in a Poolside → Codex → Claude loop.
+
+Repository: {root}
+Original base commit: {base_commit or '(unknown)'}
+Review round: {round_number}
+
+Codex peer-review summary:
+{codex_review or '(Codex supplied no review text.)'}
+
+Repository snapshot captured by Tincan:
+{diff_snapshot}
+
+Inspect the repository and all changes since the base commit, including untracked files.
+Read the relevant surrounding code and any AGENTS.md / CLAUDE.md files.  Run focused
+verification when useful (one command at a time, no shell chaining).  Do not edit, do not
+change git state, do not install dependencies, do not touch secrets or network.
+
+Mark a finding **blocking** only for a concrete correctness, security, data-loss,
+regression, test, or stated-requirement problem that should prevent completion.
+Style preferences and optional improvements do not block approval.
+
+Return a structured verdict with the schema provided via --json-schema.
+"""
+    # Note: previous_claude_session is used to maintain Claude conversation context
+    # across review rounds, providing better continuity.
+    _ = prior_claude_session  # handled by caller via --resume
+
+
+def run_claude_review(
+    root: Path,
+    codex_review: str,
+    round_number: int,
+    base_commit: str | None,
+    previous_session: str | None = None,
+) -> tuple[int, dict[str, Any] | None, str | None]:
+    """Run Claude in print mode for the secondary review."""
+    executable = os.environ.get("TINCAN_CLAUDE", "claude")
+
+    prompt = claude_review_prompt(
+        root, base_commit, codex_review, round_number, previous_session
+    )
+
+    args = [
+        executable, "-p",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--dangerously-skip-permissions",
+        "--permission-mode", "dontAsk",
+        "--tools", "Read,Glob,Grep,Bash",
+        "--allowedTools", CLADE_ALLOWED_TOOLS,
+        "--json-schema", json.dumps(REVIEW_SCHEMA, separators=(",", ":")),
+        prompt,
+    ]
+    if previous_session:
+        args.extend(["--resume", previous_session])
+
+    result = subprocess.run(
+        args, cwd=root, text=True, capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+    review: dict[str, Any] | None = None
+    session_id: str | None = None
+    for line in result.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        session_id = event.get("session_id") or session_id
+        if event.get("type") == "result":
+            structured = event.get("structured_output")
+            if isinstance(structured, dict):
+                review = structured
+            raw = event.get("result")
+            if isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        review = parsed
+                except json.JSONDecodeError:
+                    pass
+
+    return result.returncode, review, session_id
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+def format_findings(findings: list[dict[str, Any]]) -> str:
+    """Render findings as human-readable text for a follow-up prompt to Poolside."""
+    if not findings:
+        return "(no findings were reported)"
+    lines = []
+    for i, f in enumerate(findings, 1):
+        location = f.get("file") or "repository"
+        if f.get("line") is not None:
+            location += f":{f['line']}"
+        lines.append(
+            f"{i}. [{f['severity'].upper()}] {f.get('title', 'Finding')} ({location})\n"
+            f"   {f.get('details', '')}"
+        )
+    return "\n".join(lines)
+
+
+def blocking_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [f for f in findings if f.get("severity") == "blocking"]
+
+
+def followup_prompt(findings_text: str, codex_review: str = "", claude_review: str = "") -> str:
+    """Build a prompt for the follow-up pool exec round."""
+    parts = ["Address these review findings from the previous round:\n"]
+    parts.append(findings_text)
+    parts.append("\n\nOriginal Codex review:\n" + codex_review)
+    parts.append("\n\nOriginal Claude review:\n" + claude_review)
+    parts.append(
+        "\n\nAfter fixing, summarize what you changed and how you handled each "
+        "blocking finding. Do not proceed until the review passes."
+    )
+    return "\n".join(parts)
+
+
+def print_round_summary(
+    round_number: int,
+    codex_review: str,
+    codex_findings: list[dict[str, Any]],
+    claude_review: dict[str, Any] | None,
+    status: str,
+) -> None:
+    print(f"\n{'=' * 60}")
+    print(f" Review round {round_number}")
+    print(f"{'=' * 60}")
+    print(f"\nCodex peer review:\n{codex_review}")
+    codex_blockers = blocking_findings(codex_findings)
+    if codex_blockers:
+        print(f"\n  Codex blocking findings ({len(codex_blockers)}):")
+        for f in codex_blockers:
+            loc = f.get("file") or "repo"
+            if f.get("line"):
+                loc += f":{f['line']}"
+            print(f"    • {f['title']} ({loc}): {f['details']}")
+    else:
+        print("\n  Codex: no blocking findings — approved.")
+
+    if claude_review:
+        print(f"\nClaude secondary review: {claude_review.get('summary', '')}")
+        claude_blockers = blocking_findings(claude_review.get("findings", []))
+        if claude_blockers:
+            print(f"  Claude blocking findings ({len(claude_blockers)}):")
+            for f in claude_blockers:
+                loc = f.get("file") or "repo"
+                if f.get("line"):
+                    loc += f":{f['line']}"
+                print(f"    • {f['title']} ({loc}): {f['details']}")
+        else:
+            print("\n  Claude: no blocking findings — approved.")
+
+    if claude_review and claude_review.get("verification"):
+        print(f"\n  Claude verification:\n" + "\n".join(
+            f"    • {v}" for v in claude_review["verification"]))
+
+    print(f"\n  Status: {status}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Main orchestration
+# ---------------------------------------------------------------------------
+
+def cmd_pool_exec(args: argparse.Namespace) -> int:
+    root, git_dir = git_paths(Path(args.repo))
+    state_dir = git_dir / "tincan"
+    state = load_state(state_dir)
+
+    # Initialise poolside-mode state if needed.
+    if not state.get("poolside_mode"):
+        state["poolside_mode"] = True
+        state["poolside_max_rounds"] = args.max_rounds
+        state["poolside_round"] = 0
+        if not state.get("base_commit"):
+            state["base_commit"] = current_head(root)
+        save_state(state_dir, state)
+    else:
+        # Honour an explicit --max-rounds on a fresh start.
+        if args.max_rounds != 5 and state.get("poolside_round", 0) == 0:
+            state["poolside_max_rounds"] = args.max_rounds
+            save_state(state_dir, state)
+
+    max_rounds = int(state.get("poolside_max_rounds", args.max_rounds))
+    base_commit = state.get("base_commit")
+
+    # Read prompt from file or argument.
+    if args.file:
+        prompt = Path(args.file).expanduser().read_text()
+    else:
+        prompt = args.prompt or ""
+
+    run_id: str | None = state.get("poolside_run_id")
+    continue_mode = args.continue_run or (run_id is not None)
+
+    for round_number in range(int(state.get("poolside_round", 0)) + 1, max_rounds + 1):
+        state["poolside_round"] = round_number
+        save_state(state_dir, state)
+
+        # --- Step 1: Poolside implementation ---
+        print(f"\n{'─' * 60}")
+        print(f" Poolside  ·  round {round_number}/{max_rounds}")
+        print(f" task: {prompt[:120]}{'...' if len(prompt) > 120 else ''}")
+        print(f"{'─' * 60}\n")
+
+        pool_rc, pool_out, new_run_id = run_pool_exec(
+            root, prompt, continue_run=continue_mode
+        )
+
+        if new_run_id:
+            run_id = new_run_id
+            state["poolside_run_id"] = run_id
+
+        if pool_rc != 0:
+            print(
+                f"\npool exec exited with code {pool_rc}. "
+                "Review the output above; the review gate remains armed."
+            )
+            state["poolside_last_error"] = f"pool exec exited {pool_rc}"
+            save_state(state_dir, state)
+            return pool_rc
+
+        if not has_changes(root, base_commit):
+            print("\n⚠ No git changes detected — pool exec did not modify any files.")
+            state.update(poolside_status="no-changes")
+            save_state(state_dir, state)
+            return 0
+
+        # --- Step 2: Codex peer review ---
+        if not args.skip_codex:
+            print(f"\n{'─' * 60}")
+            print(f" Codex review  ·  round {round_number}")
+            print(f"{'─' * 60}\n")
+
+            codex_rc, codex_review, codex_findings = run_codex_review(root)
+            codex_blockers = blocking_findings(codex_findings)
+
+            if codex_blockers:
+                findings_text = format_findings(codex_findings)
+                print_round_summary(
+                    round_number, codex_review, codex_findings, None,
+                    "CHANGES_REQUESTED — sending back to Poolside"
+                )
+                prompt = followup_prompt(findings_text, codex_review)
+                continue_mode = True
+                state.update(
+                    poolside_status="changes-requested",
+                    poolside_last_findings=codex_findings,
+                )
+                save_state(state_dir, state)
+                continue
+        else:
+            codex_rc, codex_review, codex_findings = 0, "", []
+
+        # --- Step 3: Claude secondary review ---
+        if not args.skip_claude:
+            print(f"\n{'─' * 60}")
+            print(f" Claude review  ·  round {round_number}")
+            print(f"{'─' * 60}\n")
+
+            claude_rc, claude_review, claude_session = run_claude_review(
+                root, codex_review, round_number, base_commit,
+                previous_session=state.get("poolside_claude_session"),
+            )
+
+            if claude_session:
+                state["poolside_claude_session"] = claude_session
+
+            if claude_rc != 0 or not claude_review:
+                print(f"\n⚠ Claude review failed (exit {claude_rc}).")
+                state.update(poolside_status="claude-failed")
+                save_state(state_dir, state)
+                return 1
+
+            claude_blockers = blocking_findings(claude_review.get("findings", []))
+            if claude_blockers:
+                findings_text = format_findings(claude_review["findings"])
+                print_round_summary(
+                    round_number, codex_review, codex_findings, claude_review,
+                    "CHANGES_REQUESTED — sending back to Poolside"
+                )
+                prompt = followup_prompt(
+                    findings_text, codex_review,
+                    f"verdict={claude_review['verdict']} summary={claude_review['summary']}",
+                )
+                continue_mode = True
+                state.update(
+                    poolside_status="changes-requested",
+                    poolside_last_findings=claude_review["findings"],
+                )
+                save_state(state_dir, state)
+                continue
+
+            if args.skip_codex:
+                status_msg = "APPROVED — Claude approved"
+            else:
+                status_msg = "APPROVED — both Codex and Claude approved"
+            print_round_summary(
+                round_number, codex_review, codex_findings, claude_review,
+                status_msg
+            )
+        else:
+            if args.skip_codex:
+                # No reviewers — pool exec alone
+                print(f"\n{'─' * 60}")
+                print(f" No review step (both Codex and Claude skipped)")
+                print(f"{'─' * 60}\n")
+                state.update(
+                    poolside_status="approved",
+                    poolside_approved_at=utc_now(),
+                    poolside_round=round_number,
+                )
+                save_state(state_dir, state)
+                print("\n✅ Pool exec completed. No review gate configured.")
+                return 0
+
+            # Codex approved, Claude skipped
+            print_round_summary(
+                round_number, codex_review, codex_findings, None,
+                "APPROVED — Codex approved (Claude review skipped)"
+            )
+
+        # --- Both approved (or only reviewer approved) ---
+        state.update(
+            poolside_status="approved",
+            poolside_approved_at=utc_now(),
+            poolside_round=round_number,
+        )
+        save_state(state_dir, state)
+        print("\n✅ Review passed. The work is approved.")
+        return 0
+
+    # Reached max rounds
+    print(f"\n⛔ Reached the {max_rounds}-round limit. A human should adjudicate.")
+    state.update(poolside_status="needs-human")
+    save_state(state_dir, state)
+    return 1
+
+
+def cmd_pool_review(args: argparse.Namespace) -> int:
+    """Run just the Codex → Claude review chain on current uncommitted changes."""
+    root, git_dir = git_paths(Path(args.repo))
+    state_dir = git_dir / "tincan"
+    state = load_state(state_dir)
+    base_commit = state.get("base_commit") or current_head(root)
+
+    round_number = int(state.get("poolside_round", 0)) + 1
+    state["poolside_round"] = round_number
+    save_state(state_dir, state)
+
+    # Codex review
+    codex_rc, codex_review, codex_findings = run_codex_review(root)
+    codex_blockers = blocking_findings(codex_findings)
+
+    if codex_blockers:
+        print(f"Codex found {len(codex_blockers)} blocking finding(s):")
+        print(codex_review)
+        print("\n" + format_findings(codex_findings))
+        state.update(poolside_status="codex-changes-requested")
+        save_state(state_dir, state)
+        return 2
+
+    # Claude secondary review
+    claude_rc, claude_review, _ = run_claude_review(
+        root, codex_review, round_number, base_commit,
+        previous_session=state.get("poolside_claude_session"),
+    )
+
+    if claude_rc != 0 or not claude_review:
+        print(f"Claude review failed (exit {claude_rc}).")
+        state.update(poolside_status="claude-failed")
+        save_state(state_dir, state)
+        return 1
+
+    claude_blockers = blocking_findings(claude_review.get("findings", []))
+    if claude_blockers:
+        print(f"Claude found {len(claude_blockers)} blocking finding(s):")
+        print(claude_review.get("summary", ""))
+        print("\n" + format_findings(claude_review["findings"]))
+        state.update(poolside_status="claude-changes-requested")
+        save_state(state_dir, state)
+        return 2
+
+    print(f"Both Codex and Claude approved the work in round {round_number}.")
+    state.update(
+        poolside_status="approved",
+        poolside_approved_at=utc_now(),
+        poolside_round=round_number,
+    )
+    save_state(state_dir, state)
+    return 0
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        prog="tincan-pool-exec",
+        description="Run Poolside as the implementation agent, then chain Codex and Claude reviews.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # pool-exec subcommand
+    exec_p = sub.add_parser("pool-exec", help="run pool exec → codex review → claude review")
+    exec_p.add_argument("--repo", default=".")
+    exec_p.add_argument("-p", "--prompt", default=None)
+    exec_p.add_argument("-f", "--file", default=None,
+                        help="read the prompt from this file")
+    exec_p.add_argument("--max-rounds", type=int, default=5)
+    exec_p.add_argument("--continue", dest="continue_run", action="store_true",
+                        help="resume the previous poolside run with review findings")
+    exec_p.add_argument("--dry-run", action="store_true",
+                        help="print state and exit without running agents")
+    exec_p.add_argument("--skip-codex", action="store_true",
+                        help="skip the Codex peer-review step")
+    exec_p.add_argument("--skip-claude", action="store_true",
+                        help="skip the Claude secondary-review step")
+    exec_p.set_defaults(func=cmd_pool_exec)
+
+    # pool-review subcommand
+    review_p = sub.add_parser("pool-review", help="run codex → claude review on existing changes")
+    review_p.add_argument("--repo", default=".")
+    review_p.set_defaults(func=cmd_pool_review)
+
+    return parser.parse_args(argv)
+
+
+def main() -> int:
+    args = parse_args()
+
+    if getattr(args, "dry_run", False):
+        root, git_dir = git_paths(Path(args.repo))
+        state_dir = git_dir / "tincan"
+        state = load_state(state_dir)
+        print(f"repo:      {root}")
+        print(f"pool_mode: {state.get('poolside_mode', False)}")
+        print(f"base:      {state.get('base_commit', '(not set)')}")
+        print(f"round:     {state.get('poolside_round', 0)}")
+        print(f"status:    {state.get('poolside_status', 'not started')}")
+        return 0
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

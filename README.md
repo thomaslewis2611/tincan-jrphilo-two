@@ -219,11 +219,23 @@ location dirties the project worktree.
 ```text
 tincan                              open the paired Warp workspace for this repo
 tincan warp [--repo PATH]           explicitly open the paired workspace
+tincan warp --poolside [--repo PATH]  open the three-pane Poolside workspace
 tincan brainstorm [--repo PATH]     independent views, reconsideration, synthesis
 tincan warp --tab                   open in the current Warp window
 tincan warp --max-rounds N          set the review limit (1-10)
+tincan pool-exec [-p PROMPT]        run headless Poolside → Codex → Claude loop
+tincan pool-exec --skip-codex        skip Codex peer review (Claude only)
+tincan pool-exec --skip-claude       skip Claude secondary review (Codex only)
+tincan pool-exec --continue         resume the previous pool exec run
+tincan pool-exec --dry-run          show current state without running agents
+tincan pool-review                  review current changes (Codex → Claude)
+tincan pool-exec --max-rounds N     cap review cycles in pool-exec mode
+tincan warp --poolside              open 3-pane Poolside workspace
+tincan warp --poolside --no-codex    open 2-pane (Poolside + Claude)
+tincan warp --poolside --no-claude   open 2-pane (Poolside + Codex)
 tincan send-claude MESSAGE          inject a prompt into the active Claude pane
 tincan send-codex MESSAGE           inject a prompt into the active Codex pane
+tincan send-poolside MESSAGE        inject a prompt into the active Poolside pane
 tincan doctor                       check local prerequisites
 ```
 
@@ -244,6 +256,109 @@ tincan issues [--repo PATH]         list GitHub issues
 
 The legacy file bridge commands `ask`, `listen`, `demo`, `transcript`, and `clear`
 are retained for experiments documented in [docs/CONSTRAINTS.md](docs/CONSTRAINTS.md).
+
+## Poolside mode
+
+Poolside can serve as the implementation lead, with Codex and Claude performing
+peer and secondary review respectively. Three workflows are supported:
+
+### Headless: `tincan pool-exec`
+
+Runs a fully automated loop without Warp:
+
+```sh
+tincan pool-exec --repo ~/dev/your-project \
+  -p "Implement the requested feature in the user-service module"
+```
+
+The pipeline runs: **Poolside (implement) → Codex (peer review) → Claude (secondary review)**,
+reporting each round's verdict. When both reviewers approve, the cycle ends. Blocking
+findings are fed back to Poolside as a follow-up prompt and the loop repeats, up to
+`--max-rounds` (default 5).
+
+```sh
+tincan pool-exec -p "..."                    # fresh pool exec run
+tincan pool-exec -p "..." --max-rounds 3     # cap at 3 review cycles
+tincan pool-exec -p "..." --continue         # resume the previous pool run
+tincan pool-exec --dry-run                   # show current state without running
+tincan pool-review                           # review only (Codex → Claude on current changes)
+```
+
+The `pool` binary must be on `PATH`. If it lives in `~/.local/bin`, ensure that
+directory is on your shell's `PATH`. You can also override the binary with the
+`TINCAN_POOL` environment variable (e.g. `TINCAN_POOL=~/.local/bin/pool`).
+
+### Visible: `tincan warp --poolside`
+
+Opens a three-pane Warp workspace so you can observe the review chain live:
+
+```sh
+tincan warp --repo ~/dev/your-project --poolside
+```
+
+Layout:
+
+```
+┍━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃   Poolside    ┃     Codex     ┃
+├───────────────────────────────┤
+┃           Claude             ┃
+└───────────────────────────────┘
+```
+
+Poolside writes code; Codex peer-reviews; Claude provides a secondary read-only
+review. When Claude approves, the verdict is sent back to the Poolside pane.
+Poolside can then address findings and hand off again, or start a new task.
+
+### Visible: `tincan start --poolside` + manual handoff
+
+Arms the headless gate so that Codex's Stop hook triggers the review chain:
+
+```sh
+cd ~/dev/your-project
+tincan start --poolside          # arm the gate
+# ... give Codex a task ...
+# Codex's Stop hook sends the completed work to Claude for review
+# (review hook routes Claude's verdict to the Poolside pane instead of Codex)
+```
+
+When in Poolside mode, the review hook re-arms to `awaiting-user` after approval,
+so the Poolside pane is ready for the next task immediately.
+
+### Optional reviewer exclusion
+
+Both workflows let you drop one reviewer:
+
+```sh
+# Headless — skip a reviewer
+tincan pool-exec -p "..." --skip-codex      # Poolside → Claude only
+tincan pool-exec -p "..." --skip-claude     # Poolside → Codex only
+
+# Visible — 2-pane layout
+tincan warp --repo ~/dev/project --poolside --no-claude   # Poolside + Codex
+tincan warp --repo ~/dev/project --poolside --no-codex    # Poolside + Claude
+```
+
+| Flag | Headless | Visible layout | Review chain |
+|---|---|---|---|
+| *(default)* | `pool-exec` | 3 panes | Poolside → Codex → Claude → Poolside |
+| `--skip-codex` / `--no-claude` | `pool-exec --skip-codex` | 2 panes | Poolside → Claude → Poolside |
+| `--skip-claude` / `--no-codex` | `pool-exec --skip-claude` | 2 panes | Poolside → Codex → Poolside |
+
+In `--no-claude` visible mode the review hook runs Claude headlessly (within the
+hook) and routes the verdict to the Poolside pane — no Claude pane is shown.
+In `--no-codex` visible mode the user sends from Poolside to Claude manually,
+and Claude's verdict returns to Poolside via the `tincan-pool-claude-hook`.
+
+### Key differences from Codex-led mode
+
+| Aspect | Codex-led (`tincan warp`) | Poolside-led (`tincan warp --poolside`) |
+|---|---|---|
+| Layout | 2 panes (Codex, Claude) | 3 panes (Poolside, Codex, Claude) |
+| Implementation agent | Codex | Poolside |
+| Review chain | Codex → Claude → Codex | Poolside → Codex → Claude → Poolside |
+| Post-approval | Codex summarizes | Poolside receives verdict |
+| Hook routing | Claude verdict → Codex pane | Claude verdict → Poolside pane |
 
 ## Current scope
 

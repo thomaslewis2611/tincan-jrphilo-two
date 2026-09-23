@@ -86,3 +86,19 @@ There is now a third option:
 
   c. A synchronous `Stop` hook returns a blocking reason, which the owning Codex
      process turns into a continuation prompt.
+
+## 9. Poolside has no native Stop hook
+
+Unlike Codex and Claude Code, the Poolside CLI does not expose synchronous
+lifecycle hooks (equivalent to `Stop` or `UserPromptSubmit`). It emits newline-
+delimited JSON events from `pool exec --output json`, but there is no hook
+callback that fires at turn boundaries.
+
+This is why Poolside-led visible mode (`tincan warp --poolside`) uses a manual
+handoff model: the user presses a key to trigger `handle_visible_handoff`,
+which sends completed work through the Codex → Claude review chain. The
+`tincan-pool-claude-hook` routes Claude's verdict back to the Poolside pane
+instead of Codex, because there is no Poolside hook to trigger automatically.
+
+Headless mode (`tincan pool-exec`) does not depend on hooks at all — it calls
+`pool exec`, `codex exec review`, and `claude -p` directly from a script.

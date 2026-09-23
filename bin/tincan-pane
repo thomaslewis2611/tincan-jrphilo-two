@@ -51,7 +51,7 @@ def control_socket_path(
 ) -> Path:
     identity = f"{repo}\0{session or 'legacy'}\0{agent}"
     digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
-    return Path(tempfile.gettempdir()) / f"tincan-panes-{os.getuid()}" / digest / "claude.sock"
+    return Path(tempfile.gettempdir()) / f"tincan-panes-{os.getuid()}" / digest / f"{agent}.sock"
 
 
 def active_session(repo: Path) -> str | None:
@@ -310,6 +310,24 @@ def run_codex(repo: Path, session: str) -> int:
     )
 
 
+def run_poolside(repo: Path, session: str | None) -> int:
+    """Launch the Poolside TUI in a controlled terminal pane.
+
+    In the poolside-visible review loop, Poolside is the implementation lead.
+    It runs interactively; review findings from Codex and Claude are injected
+    via the control socket as if typed by the user.
+    """
+    executable = os.environ.get("TINCAN_POOL", "pool")
+    argv = [executable]
+    settings = None
+    if session:
+        state = session_state(repo, session)
+        if state.get("mode") == "brainstorm":
+            argv = [executable, "--sandbox", "disabled"]
+        settings = state.get("poolside_settings")
+    return run_agent(repo, session, "poolside", argv)
+
+
 def send_prompt(
     repo: Path,
     prompt: str,
@@ -345,12 +363,12 @@ def send_prompt(
         while b"\n" not in response:
             chunk = client.recv(65536)
             if not chunk:
-                fail("Claude pane closed before acknowledging the prompt")
+                fail("pane closed before acknowledging the prompt")
             response.extend(chunk)
 
     result = json.loads(response.partition(b"\n")[0])
     if not result.get("ok"):
-        fail(f"Claude pane rejected the prompt: {result.get('error', 'unknown error')}")
+        fail(f"{agent.title()} pane rejected the prompt: {result.get('error', 'unknown error')}")
     print(f"sent prompt to {agent.title()} in {repo}")
     return 0
 
@@ -367,11 +385,15 @@ def parse_args() -> argparse.Namespace:
     claude.add_argument("--repo", default=".")
     claude.add_argument("--session")
 
+    poolside = subparsers.add_parser("poolside")
+    poolside.add_argument("--repo", default=".")
+    poolside.add_argument("--session")
+
     send = subparsers.add_parser("send")
     send.add_argument("prompt", nargs="?")
     send.add_argument("--repo", default=".")
     send.add_argument("--session")
-    send.add_argument("--agent", choices=("codex", "claude"), default="claude")
+    send.add_argument("--agent", choices=("codex", "claude", "poolside"), default="claude")
     send.add_argument("--wait", type=float, default=2.0)
     return parser.parse_args()
 
@@ -383,6 +405,8 @@ def main() -> int:
         return run_codex(repo, args.session)
     if args.command == "claude":
         return run_claude(repo, args.session)
+    if args.command == "poolside":
+        return run_poolside(repo, args.session)
     prompt = args.prompt if args.prompt is not None else sys.stdin.read()
     if not prompt:
         fail("send requires a prompt argument or prompt text on stdin")

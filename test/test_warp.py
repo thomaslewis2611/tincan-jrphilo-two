@@ -71,6 +71,87 @@ class WarpLauncherTests(unittest.TestCase):
             self.assertIn('name = "Tincan Brainstorm"', config)
             self.assertIn('title = "Tincan Brainstorm', config)
 
+    def test_poolside_dry_run_writes_three_pane_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo = base / "repo"
+            config_dir = base / "warp"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            environment = os.environ.copy()
+            environment["TINCAN_WARP_CONFIG_DIR"] = str(config_dir)
+
+            result = subprocess.run(
+                [str(WARP), "--repo", str(repo), "--poolside", "--dry-run"],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = (config_dir / "tincan_poolside.toml").read_text()
+            self.assertIn('name = "Tincan Poolside"', config)
+            self.assertIn("poolside", config)
+            self.assertIn("codex", config)
+            self.assertIn("claude", config)
+            self.assertIn('split = "vertical"', config)
+            self.assertIn('split = "horizontal"', config)
+            self.assertIn("tincan poolside-pane", config)
+            self.assertIn("tincan codex-pane", config)
+            self.assertIn("tincan claude-pane", config)
+            self.assertIn(f'wrote {config_dir / "tincan_poolside.toml"}', result.stdout)
+
+    def test_poolside_no_claude_dry_run_writes_two_pane_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo = base / "repo"
+            config_dir = base / "warp"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            environment = os.environ.copy()
+            environment["TINCAN_WARP_CONFIG_DIR"] = str(config_dir)
+
+            result = subprocess.run(
+                [str(WARP), "--repo", str(repo), "--poolside", "--no-claude", "--dry-run"],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = (config_dir / "tincan_poolside.toml").read_text()
+            self.assertIn('name = "Tincan Poolside (Codex review)"', config)
+            self.assertIn("poolside", config)
+            self.assertIn("codex", config)
+            self.assertIn('split = "vertical"', config)
+            self.assertNotIn("claude", config)
+            self.assertIn("tincan codex-pane", config)
+            self.assertIn("tincan poolside-pane", config)
+
+    def test_poolside_no_codex_dry_run_writes_two_pane_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo = base / "repo"
+            config_dir = base / "warp"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            environment = os.environ.copy()
+            environment["TINCAN_WARP_CONFIG_DIR"] = str(config_dir)
+
+            result = subprocess.run(
+                [str(WARP), "--repo", str(repo), "--poolside", "--no-codex", "--dry-run"],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = (config_dir / "tincan_poolside.toml").read_text()
+            self.assertIn('name = "Tincan Poolside (Claude review)"', config)
+            self.assertIn("poolside", config)
+            self.assertIn("claude", config)
+            self.assertIn('split = "vertical"', config)
+            self.assertNotIn("codex", config)
+            self.assertIn("tincan claude-pane", config)
+            self.assertIn("tincan poolside-pane", config)
+
 
 if __name__ == "__main__":
     unittest.main()

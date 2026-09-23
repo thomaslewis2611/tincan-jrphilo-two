@@ -192,6 +192,118 @@ Use APPROVED when no blocking findings remain.
 """
 
 
+def _valid_review_statuses(session: dict[str, Any]) -> tuple[str, ...]:
+    """Statuses that mean 'an agent is ready for review delivery'.
+
+    In poolside-visible mode the session starts at ``awaiting-user`` because
+    the user manually hands off Poolside's completed work to the Codex pane.
+    """
+    if session.get("poolside_mode"):
+        return ("awaiting-codex", "awaiting-user")
+    return ("awaiting-codex",)
+
+
+def _handle_no_claude_review(
+    root: Path, git_dir: Path, event: dict[str, Any], token: str,
+    session: dict[str, Any], session_path: Path, fingerprint: str | None,
+) -> dict[str, Any]:
+    """Handle the Poolside + Codex only mode (no Claude pane).
+
+    Runs Claude in headless print mode to obtain a structured secondary review,
+    then routes the verdict to the Poolside pane instead of a Claude pane.
+    """
+    round_number = int(session.get("round", 0)) + 1
+    max_rounds = int(session.get("max_rounds", 5))
+    if round_number > max_rounds:
+        session.update(enabled=False, status="needs-human")
+        save_json(session_path, session)
+        return {
+            "systemMessage": (
+                f"Tincan reached its {max_rounds}-round limit. A human should adjudicate."
+            )
+        }
+
+    state_dir = git_dir / "tincan"
+    run_dir = state_dir / "runs" / token
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / "no-claude-events.log"
+    append_log(log_path, f"\n=== NO-CLAUDE REVIEW ROUND {round_number} ({utc_now()}) ===\n")
+
+    headless_state = dict(session)
+    headless_state["run_dir"] = str(run_dir)
+    headless_state["log_path"] = str(log_path)
+    headless_state["base_commit"] = session.get("base_commit")
+
+    code, review, claude_session, error_text = run_claude(
+        root, headless_state, event, round_number, log_path
+    )
+
+    if claude_session:
+        session["claude_session_id"] = claude_session
+
+    if code or not review:
+        detail = error_text or f"Claude exited {code} without a structured review."
+        session.update(poolside_status="claude-failed")
+        save_json(session_path, session)
+        _send_to_poolside(root, token, f"⚠ Claude review failed: {detail}")
+        session["status"] = "awaiting-user"
+        session["round"] = 0
+        session["cycle"] = int(session.get("cycle", 1)) + 1
+        save_json(session_path, session)
+        return {
+            "systemMessage": (
+                "Tincan could not run the Claude review. "
+                f"Details: {detail}"
+            )
+        }
+
+    rendered = format_review(review)
+    blockers = [f for f in review.get("findings") or [] if f.get("severity") == "blocking"]
+
+    if review.get("verdict") == "approved" and not blockers:
+        if fingerprint:
+            session["approved_content_fingerprint"] = fingerprint
+        session["status"] = "awaiting-codex-summary"
+        session["poolside_claude_session"] = claude_session or session.get("poolside_claude_session")
+        save_json(session_path, session)
+        _send_to_poolside(root, token, f"✅ Claude approved.\n\n{rendered}")
+        return {
+            "systemMessage": (
+                "Claude approved the work. Summarize the result for completion."
+            )
+        }
+
+    # Changes requested — feed back to Poolside, block Codex with findings.
+    session["status"] = "awaiting-user"
+    session["poolside_round"] = round_number
+    session["poolside_status"] = "changes-requested"
+    save_json(session_path, session)
+    _send_to_poolside(root, token, f"⚠ Claude requested changes:\n\n{rendered}")
+    return {
+        "decision": "block",
+        "reason": (
+            rendered
+            + "\n\nAddress every BLOCKING finding, verify the changes, and then finish again. "
+            "The Poolside pane has received the findings."
+        ),
+    }
+
+
+def _send_to_poolside(root: Path, token: str, message: str) -> int:
+    """Send a message to the Poolside pane for the given session."""
+    pane = os.environ.get(
+        "TINCAN_PANE", str(Path(__file__).resolve().with_name("tincan-pane"))
+    )
+    result = subprocess.run(
+        [pane, "send", "--agent", "poolside", "--repo", str(root),
+         "--session", token],
+        input=message,
+        text=True,
+        capture_output=True,
+    )
+    return result.returncode
+
+
 def handle_visible_handoff(
     root: Path, git_dir: Path, event: dict[str, Any], token: str
 ) -> dict[str, Any]:
@@ -210,16 +322,27 @@ def handle_visible_handoff(
     if session.get("enabled") and session.get("status") == "awaiting-codex-summary":
         approved = session.get("approved_content_fingerprint")
         if not approved or (fingerprint and fingerprint == approved):
-            session.update(
-                status="awaiting-codex",
-                round=0,
-                cycle=int(session.get("cycle", 1)) + 1,
-            )
+            if session.get("poolside_mode"):
+                # In poolside mode, the summary came from Poolside; re-arm to
+                # awaiting-user for the next Poolside task.
+                session.update(
+                    status="awaiting-user",
+                    round=0,
+                    cycle=int(session.get("cycle", 1)) + 1,
+                )
+            else:
+                session.update(
+                    status="awaiting-codex",
+                    round=0,
+                    cycle=int(session.get("cycle", 1)) + 1,
+                )
             session.pop("review_kind", None)
             save_json(session_path, session)
             return {
                 "systemMessage": (
                     "Tincan completed the approved review cycle and is ready for another "
+                    "task." if session.get("poolside_mode")
+                    else "Tincan completed the approved review cycle and is ready for another "
                     "Codex task in these panes."
                 )
             }
@@ -229,7 +352,7 @@ def handle_visible_handoff(
         session["status"] = "awaiting-codex"
         session["review_kind"] = "followup"
 
-    if not session.get("enabled") or session.get("status") != "awaiting-codex":
+    if not session.get("enabled") or session.get("status") not in _valid_review_statuses(session):
         return {}
 
     if (
@@ -254,6 +377,13 @@ def handle_visible_handoff(
                 f"Tincan reached its {max_rounds}-round limit. A human should adjudicate."
             )
         }
+
+    # --- Review chain dispatch ---
+    if session.get("no_claude"):
+        # Poolside + Codex only: run Claude headless and route verdict to Poolside.
+        return _handle_no_claude_review(
+            root, git_dir, event, token, session, session_path, fingerprint
+        )
 
     pane = os.environ.get(
         "TINCAN_PANE", str(Path(__file__).resolve().with_name("tincan-pane"))
@@ -419,11 +549,9 @@ def run_claude(
         "--output-format",
         "stream-json",
         "--verbose",
-        "--safe-mode",
+        "--dangerously-skip-permissions",
         "--permission-mode",
         "dontAsk",
-        "--permission-prompts",
-        "none",
         "--tools",
         "Read,Glob,Grep,Bash",
         "--allowedTools",

@@ -171,7 +171,18 @@ def cmd_start(args: argparse.Namespace) -> int:
     if not config_path.exists() or MARKER not in config_path.read_text():
         raise SystemExit(f"review hook is not installed; run: tincan install --repo {root}")
 
-    label = "the task described in the Codex chat"
+    if args.poolside:
+        label = "the task described for the Poolside → Codex → Claude review loop"
+        mode_desc = "Poolside implementation mode"
+        armed_msg = (
+            "Now use poolside normally (or run `tincan pool-exec`). "
+            "Its completed turns will be sent through the Codex → Claude review chain."
+        )
+    else:
+        label = "the task described in the Codex chat"
+        mode_desc = None
+        armed_msg = "Now use Codex normally. Its next completed turn in this repo will claim the gate."
+
     contexts: list[str] = []
     if args.issue:
         label, fetched = issue_context(root, args.issue)
@@ -202,11 +213,16 @@ def cmd_start(args: argparse.Namespace) -> int:
         "run_dir": str(run_dir),
         "log_path": str(log_path),
     }
+    if args.poolside:
+        state["poolside_mode"] = True
+        state["poolside_round"] = 0
     save_state(state_dir, state)
     print(f"armed for {label}")
     print(f"base: {base[:12]}")
-    print("Now use Codex normally. Its next completed turn in this repo will claim the gate.")
-    print(f"Claude activity: tincan watch --repo {root}")
+    if mode_desc:
+        print(f"mode:   {mode_desc}")
+    print(armed_msg)
+    print(f"Review activity: tincan watch --repo {root}")
     return 0
 
 
@@ -234,11 +250,19 @@ def cmd_status(args: argparse.Namespace) -> int:
     if not state:
         print("gate:      not armed")
         return 0
+    poolside = state.get("poolside_mode")
+    print(f"mode:      {'poolside (pool → codex → claude)' if poolside else 'codex → claude'}")
     print(f"gate:      {state.get('status', 'unknown')}")
     print(f"task:      {state.get('task_label', '(unspecified)')}")
-    print(f"round:     {state.get('round', 0)}/{state.get('max_rounds', '?')}")
-    print(f"codex:     {state.get('session_id') or '(not claimed yet)'}")
-    print(f"claude:    {state.get('claude_session_id') or '(not started yet)'}")
+    if poolside:
+        print(f"round:     {state.get('poolside_round', 0)}/{state.get('max_rounds', '?')}")
+        print(f"pool:      {state.get('poolside_run_id') or '(not started yet)'}")
+        print(f"claude:    {state.get('poolside_claude_session') or '(not started yet)'}")
+        print(f"status:    {state.get('poolside_status', '(not started)')}")
+    else:
+        print(f"round:     {state.get('round', 0)}/{state.get('max_rounds', '?')}")
+        print(f"codex:     {state.get('session_id') or '(not claimed yet)'}")
+        print(f"claude:    {state.get('claude_session_id') or '(not started yet)'}")
     print(f"log:       {state.get('log_path', '(none)')}")
     return 0
 
@@ -272,6 +296,8 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--repo", default=".")
     start.add_argument("--issue")
     start.add_argument("--max-rounds", type=int, choices=range(1, 11), default=5)
+    start.add_argument("--poolside", action="store_true",
+                       help="arm the gate for Poolside implementation with Codex + Claude reviews")
     start.add_argument("task", nargs="*")
     start.set_defaults(func=cmd_start)
 

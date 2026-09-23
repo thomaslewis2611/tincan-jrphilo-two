@@ -17,6 +17,7 @@ import tempfile
 
 
 CONFIG_STEM = "tincan_pair"
+POOLSIDE_CONFIG_STEM = "tincan_poolside"
 
 
 def fail(message: str) -> "NoReturn":
@@ -62,45 +63,76 @@ def ensure_hook(repo: Path) -> None:
         fail("could not install the Codex handoff hook; see the message above")
 
 
-def create_session(repo: Path, token: str, max_rounds: int, mode: str) -> Path:
+def _poolside_claude_settings_path(sessions: Path, token: str) -> Path:
+    """Path for Claude settings that routes reviews to poolside (not codex)."""
+    return sessions / f"{token}-poolside-claude-settings.json"
+
+
+def create_session(repo: Path, token: str, max_rounds: int, mode: str,
+                   poolside: bool = False,
+                   no_codex: bool = False, no_claude: bool = False) -> Path:
     state_dir = git_dir(repo) / "tincan"
     sessions = state_dir / "pane-sessions"
     sessions.mkdir(parents=True, exist_ok=True)
-    hook_name = (
-        "tincan-brainstorm-hook" if mode == "brainstorm" else "tincan-claude-hook"
-    )
+    if poolside:
+        hook_name = "tincan-pool-claude-hook"
+    else:
+        hook_name = (
+            "tincan-brainstorm-hook" if mode == "brainstorm" else "tincan-claude-hook"
+        )
+        review_hook_name = "tincan-review-hook"
     claude_hook = Path(__file__).resolve().with_name(hook_name)
     settings_path = sessions / f"{token}-claude-settings.json"
-    settings_path.write_text(
-        json.dumps(
-            {
-                "hooks": {
-                    "Stop": [
-                        {
-                            "hooks": [
-                                {
-                                    "type": "command",
-                                    "command": str(claude_hook),
-                                    "timeout": 30,
-                                    "statusMessage": (
-                                        "Coordinating the brainstorm"
-                                        if mode == "brainstorm"
-                                        else "Sending Claude's review to Codex"
-                                    ),
-                                }
-                            ]
-                        }
-                    ]
-                }
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n"
-    )
+
+    if not poolside:
+        settings = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": str(claude_hook),
+                                "timeout": 30,
+                                "statusMessage": (
+                                    "Coordinating the brainstorm"
+                                    if mode == "brainstorm"
+                                    else "Sending Claude's review to Codex"
+                                ),
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        settings_path.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n")
+    else:
+        # In poolside mode, Claude's Stop hook sends the verdict to the
+        # Poolside pane instead of back to the Codex pane.
+        settings = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": str(claude_hook),
+                                "timeout": 30,
+                                "statusMessage": "Sending Claude's review to Poolside",
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        settings_path.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n")
+
     value = {
         "enabled": True,
         "mode": mode,
+        "poolside_mode": poolside,
+        "no_codex": no_codex,
+        "no_claude": no_claude,
         "repo": str(repo),
         "session_token": token,
         "status": "awaiting-user" if mode == "brainstorm" else "awaiting-codex",
@@ -111,6 +143,13 @@ def create_session(repo: Path, token: str, max_rounds: int, mode: str) -> Path:
         "max_rounds": max_rounds,
         "claude_settings": str(settings_path),
     }
+    if poolside:
+        value["status"] = "awaiting-user"
+        value["review_chain"] = (
+            ["poolside", "claude", "poolside"] if no_codex
+            else (["poolside", "codex", "poolside"] if no_claude
+                  else ["poolside", "codex", "claude", "poolside"])
+        )
     session_path = sessions / f"{token}.json"
     session_path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
     active = state_dir / "active-pane-session.json"
@@ -120,7 +159,9 @@ def create_session(repo: Path, token: str, max_rounds: int, mode: str) -> Path:
     return session_path
 
 
-def render_config(repo: Path, session: str, mode: str = "visible-review-loop") -> str:
+def render_config(repo: Path, session: str, mode: str = "visible-review-loop",
+                  poolside: bool = False, no_codex: bool = False,
+                  no_claude: bool = False) -> str:
     repo_text = str(repo)
     tincan = Path(__file__).resolve().with_name("tincan")
     codex_command = " ".join(
@@ -131,6 +172,96 @@ def render_config(repo: Path, session: str, mode: str = "visible-review-loop") -
         shlex.quote(part)
         for part in (str(tincan), "claude-pane", "--repo", repo_text, "--session", session)
     )
+    poolside_command = " ".join(
+        shlex.quote(part)
+        for part in (str(tincan), "poolside-pane", "--repo", repo_text, "--session", session)
+    )
+    if poolside and not no_claude and not no_codex:
+        # Full 3-pane: Poolside + Codex (top) + Claude (bottom)
+        label = "Tincan Poolside"
+        return f'''name = {toml_string(label)}
+title = {toml_string(f"{label} · {repo.name}")}
+color = "cyan"
+
+[[panes]]
+id = "root"
+split = "vertical"
+children = ["top", "claude"]
+
+[[panes]]
+id = "top"
+split = "horizontal"
+children = ["poolside", "codex"]
+
+[[panes]]
+id = "poolside"
+type = "terminal"
+directory = {toml_string(repo_text)}
+commands = [{toml_string(poolside_command)}]
+is_focused = true
+
+[[panes]]
+id = "codex"
+type = "terminal"
+directory = {toml_string(repo_text)}
+commands = [{toml_string(codex_command)}]
+
+[[panes]]
+id = "claude"
+type = "terminal"
+directory = {toml_string(repo_text)}
+commands = [{toml_string(claude_command)}]
+'''
+    if poolside and no_claude:
+        # 2-pane: Poolside (top) + Codex (bottom). Review goes Codex → Poolside.
+        label = "Tincan Poolside (Codex review)"
+        return f'''name = {toml_string(label)}
+title = {toml_string(f"{label} · {repo.name}")}
+color = "cyan"
+
+[[panes]]
+id = "root"
+split = "vertical"
+children = ["poolside", "codex"]
+
+[[panes]]
+id = "poolside"
+type = "terminal"
+directory = {toml_string(repo_text)}
+commands = [{toml_string(poolside_command)}]
+is_focused = true
+
+[[panes]]
+id = "codex"
+type = "terminal"
+directory = {toml_string(repo_text)}
+commands = [{toml_string(codex_command)}]
+'''
+    if poolside and no_codex:
+        # 2-pane: Poolside (top) + Claude (bottom). Review goes Claude → Poolside.
+        label = "Tincan Poolside (Claude review)"
+        return f'''name = {toml_string(label)}
+title = {toml_string(f"{label} · {repo.name}")}
+color = "cyan"
+
+[[panes]]
+id = "root"
+split = "vertical"
+children = ["poolside", "claude"]
+
+[[panes]]
+id = "poolside"
+type = "terminal"
+directory = {toml_string(repo_text)}
+commands = [{toml_string(poolside_command)}]
+is_focused = true
+
+[[panes]]
+id = "claude"
+type = "terminal"
+directory = {toml_string(repo_text)}
+commands = [{toml_string(claude_command)}]
+'''
     label = "Tincan Brainstorm" if mode == "brainstorm" else "Tincan Pair"
     return f'''name = {toml_string(label)}
 title = {toml_string(f"{label} · {repo.name}")}
@@ -157,21 +288,27 @@ commands = [{toml_string(claude_command)}]
 
 
 def write_config(
-    repo: Path, session: str, mode: str = "visible-review-loop"
+    repo: Path, session: str, mode: str = "visible-review-loop", poolside: bool = False,
+    no_codex: bool = False, no_claude: bool = False,
 ) -> Path:
     config_dir = Path(
         os.environ.get("TINCAN_WARP_CONFIG_DIR", "~/.warp/tab_configs")
     ).expanduser()
+    if poolside:
+        stem = POOLSIDE_CONFIG_STEM
+    else:
+        stem = CONFIG_STEM
     config_dir.mkdir(parents=True, exist_ok=True)
-    destination = config_dir / f"{CONFIG_STEM}.toml"
+    destination = config_dir / f"{stem}.toml"
 
     handle, temporary_name = tempfile.mkstemp(
-        prefix=f".{CONFIG_STEM}.", suffix=".toml", dir=config_dir
+        prefix=f".{stem}.", suffix=".toml", dir=config_dir
     )
     temporary = Path(temporary_name)
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            stream.write(render_config(repo, session, mode))
+            stream.write(render_config(repo, session, mode, poolside=poolside,
+                                   no_codex=no_codex, no_claude=no_claude))
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
@@ -209,6 +346,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="run an independent-first Codex and Claude brainstorm",
     )
+    parser.add_argument(
+        "--poolside",
+        action="store_true",
+        help="run Poolside as implementation with Codex and Claude as reviewers "
+        "(3-pane layout)",
+    )
+    parser.add_argument(
+        "--no-codex",
+        action="store_true",
+        help="exclude Codex from the poolside review chain "
+        "(requires --poolside; 2-pane: Poolside + Claude)",
+    )
+    parser.add_argument(
+        "--no-claude",
+        action="store_true",
+        help="exclude Claude from the poolside review chain "
+        "(requires --poolside; 2-pane: Poolside + Codex)",
+    )
     return parser.parse_args()
 
 
@@ -219,14 +374,29 @@ def main() -> int:
     missing = [command for command in ("codex", "claude") if not shutil.which(command)]
     if missing and not args.dry_run:
         fail(f"missing from PATH: {', '.join(missing)}")
+    if args.poolside and not shutil.which("pool") and not args.dry_run:
+        fail("pool is not on PATH; install the Poolside CLI to use --poolside mode")
+    if args.poolside and args.no_codex and args.no_claude:
+        fail("--no-codex and --no-claude are mutually exclusive; at least one reviewer is required")
 
     session = secrets.token_hex(16)
     mode = "brainstorm" if args.brainstorm else "visible-review-loop"
+    config_stem = POOLSIDE_CONFIG_STEM if args.poolside else CONFIG_STEM
     if not args.dry_run:
         ensure_hook(repo)
-        create_session(repo, session, args.max_rounds, mode)
-    destination = write_config(repo, session, mode)
-    uri = f"warp://tab_config/{CONFIG_STEM}"
+        create_session(
+            repo, session, args.max_rounds, mode,
+            poolside=args.poolside,
+            no_codex=getattr(args, "no_codex", False),
+            no_claude=getattr(args, "no_claude", False),
+        )
+    destination = write_config(
+        repo, session, mode,
+        poolside=args.poolside,
+        no_codex=getattr(args, "no_codex", False),
+        no_claude=getattr(args, "no_claude", False),
+    )
+    uri = f"warp://tab_config/{config_stem}"
     if not args.tab:
         uri += "?new_window=true"
 
@@ -244,6 +414,13 @@ def main() -> int:
     print(f"opened Tincan for {repo} (session {session[:8]})")
     if args.brainstorm:
         print("Ready. Ask in Codex; Tincan will gather both independent views.")
+    elif args.poolside:
+        if args.no_claude:
+            print("Ready. Give Poolside a task; send reviews with 'tincan send-codex'.")
+        elif args.no_codex:
+            print("Ready. Give Poolside a task; send reviews with 'tincan send-claude'.")
+        else:
+            print("Ready. Give Poolside a task; send reviews with 'tincan send-codex'.")
     else:
         print("Ready. Give Codex a normal task.")
     return 0
