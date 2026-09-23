@@ -87,18 +87,18 @@ There is now a third option:
   c. A synchronous `Stop` hook returns a blocking reason, which the owning Codex
      process turns into a continuation prompt.
 
-## 9. Poolside has no native Stop hook
+## 9. Poolside lifecycle hooks use a different protocol
 
-Unlike Codex and Claude Code, the Poolside CLI does not expose synchronous
-lifecycle hooks (equivalent to `Stop` or `UserPromptSubmit`). It emits newline-
-delimited JSON events from `pool exec --output json`, but there is no hook
-callback that fires at turn boundaries.
+Poolside CLI 1.0.16 supports native `SessionStart`, `UserPromptSubmit`, and `Stop`
+hooks. See the [Poolside hook reference](https://docs.poolside.ai/hooks).
+Its protocol uses snake_case (`hook_specific_output`, `additional_context`), unlike
+the Claude/Codex hook response format. The Stop payload contains a `reason` and
+`trajectory_path`, not `last_assistant_message`; Tincan reads the final assistant
+message from that trajectory for review context.
 
-This is why Poolside-led visible mode (`tincan warp --poolside`) uses a manual
-handoff model: the user presses a key to trigger `handle_visible_handoff`,
-which sends completed work through the Codex → Claude review chain. The
-`tincan-pool-claude-hook` routes Claude's verdict back to the Poolside pane
-instead of Codex, because there is no Poolside hook to trigger automatically.
-
-Headless mode (`tincan pool-exec`) does not depend on hooks at all — it calls
-`pool exec`, `codex exec review`, and `claude -p` directly from a script.
+Visible Poolside sessions load private hook settings through `pool -- --settings`.
+Hooks advance a session-scoped controller; Codex and Claude run in their own normal
+terminal processes and return read-only verdicts through their Stop hooks. Poolside
+never needs to spawn either reviewer inside its tool sandbox. Both enabled reviewers
+must approve identical content before Poolside finalizes. Headless `pool-exec`
+remains a separate execution path.

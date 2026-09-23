@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Poolside lifecycle adapter (snake_case hook protocol, CLI >= 1.0.16)."""
+import json
+import os
+from pathlib import Path
+import sys
+from tincan_pool_loop import handle, helpers
+
+
+def main():
+    try:
+        event = json.load(sys.stdin)
+    except (ValueError, OSError):
+        return 0
+    paths = helpers.git_paths(Path(event.get("cwd") or os.getcwd()))
+    if paths:
+        result = handle(*paths, event, os.environ.get("TINCAN_SESSION", ""), "poolside")
+        # Pool does not recognize Claude/Codex's camelCase systemMessage field.
+        if result.get("systemMessage"):
+            state = helpers.load_json(paths[1] / "tincan" / "pane-sessions" /
+                                      f"{os.environ.get('TINCAN_SESSION', '')}.json")
+            if state.get("status") == "handoff-failed":
+                # Pool hides informational hook output. A single continuation
+                # reports delivery failure visibly; the disabled state prevents
+                # that reporting turn from starting another review.
+                print(json.dumps({"continue": True, "hook_specific_output": {
+                    "additional_context": result["systemMessage"] +
+                    " Tell the user the review could not be completed; do not claim approval."
+                }}))
+            else:
+                print(result["systemMessage"], file=sys.stderr)
+        else:
+            print(json.dumps(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
